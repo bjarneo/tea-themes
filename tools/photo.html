@@ -1,0 +1,1550 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Photo renderer</title>
+<style>html,body{margin:0;background:#000}</style>
+</head>
+<body>
+<script>
+// Photographic backgrounds of the tea themes. The page ray-marches 3D scenes
+// on the GPU with WebGL2: soft shadows, ambient occlusion, glossy reflections
+// and depth of field, then a filmic tone curve and grain. tools/photo.mjs
+// calls setup() once and renderPhoto() for each image. Chromium needs
+// --use-angle=vulkan to use the GPU; without it, SwiftShader renders on the
+// CPU and is very slow.
+//
+// Each image adds up many samples. Every sample moves the pixel a little for
+// anti-aliasing and moves the camera inside the lens for depth of field. The
+// frame renders in tiles, so no single draw call runs long on the GPU.
+//
+// Scenes:
+//   leaves    the dry tea on a table, from a low angle
+//   cup       the tea in its cup, from above at an angle
+//   swirl     a close-up of the surface of the tea: foam, or milk that swirls in
+//   float     a close-up of jasmine blossoms that float on the tea
+//   wordmark  the Omarchy wordmark spelled in the dry tea on a table
+//   top       the cup straight from above, the still under the steam video
+//
+// Each kind of dry tea has its own shapes, so each scene compiles once for
+// each kind: powder (matcha), twisted leaves (Earl Grey), whole spices
+// (masala chai) and pearls (jasmine).
+
+const canvas = document.createElement('canvas');
+const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false });
+let contextLosses = 0;
+canvas.addEventListener('webglcontextlost', e => { contextLosses++; e.preventDefault(); });
+window.diagnostics = () => ({ contextLosses, lost: gl.isContextLost(), error: gl.getError() });
+gl.getExtension('EXT_color_buffer_float');
+const floatLinear = !!gl.getExtension('OES_texture_float_linear');
+let logoTexture = null, logoInfo = null;
+const programs = {};
+
+// ---------- colors ----------
+
+function rgb(hex) { return [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16)); }
+function lin(hex) { return rgb(hex).map(v => { v /= 255; return v <= .04045 ? v / 12.92 : ((v + .055) / 1.055) ** 2.4; }); }
+function mix(a, b, t) { const pa = rgb(a), pb = rgb(b); return '#' + pa.map((v, i) => Math.round(v * (1 - t) + pb[i] * t).toString(16).padStart(2, '0')).join(''); }
+
+function rng(seed) {
+  return () => {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- the wordmark as a distance field ----------
+
+// The letters become a signed distance field in logo units (the SVG is
+// 1215 x 285). The shaders draw it on the table, in the foam and on the
+// bottom of the cup.
+window.setup = paths => {
+  const SCALE = 3, PAD = 64, w = 1215 * SCALE + PAD * 2, h = 285 * SCALE + PAD * 2;
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const cx = c.getContext('2d');
+  cx.fillStyle = '#000'; cx.fillRect(0, 0, w, h);
+  cx.translate(PAD, PAD); cx.scale(SCALE, SCALE); cx.fillStyle = '#fff';
+  paths.forEach(p => cx.fill(new Path2D(p.d), p.evenodd ? 'evenodd' : 'nonzero'));
+  const img = cx.getImageData(0, 0, w, h).data;
+  const inside = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) inside[i] = img[i * 4] > 127 ? 1 : 0;
+  const dOut = edt(inside, w, h, 0), dIn = edt(inside, w, h, 1);
+  const field = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) field[i] = (Math.sqrt(dOut[i]) - Math.sqrt(dIn[i])) / SCALE;
+  logoTexture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, logoTexture);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, w, h, 0, gl.RED, gl.FLOAT, field);
+  const filter = floatLinear ? gl.LINEAR : gl.NEAREST;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  logoInfo = { w, h, scale: SCALE, pad: PAD };
+  return true;
+};
+
+// Squared Euclidean distance to the nearest pixel whose value differs from
+// `of`, by the Felzenszwalb and Huttenlocher method.
+function edt(mask, w, h, of) {
+  const INF = 1e20, d = new Float64Array(w * h);
+  for (let i = 0; i < w * h; i++) d[i] = mask[i] === of ? INF : 0;
+  const n = Math.max(w, h), f = new Float64Array(n), out = new Float64Array(n), v = new Int32Array(n), z = new Float64Array(n + 1);
+  const pass = (len, get, set) => {
+    for (let q = 0; q < len; q++) f[q] = get(q);
+    let k = 0; v[0] = 0; z[0] = -INF; z[1] = INF;
+    for (let q = 1; q < len; q++) {
+      let s;
+      do { const p = v[k]; s = ((f[q] + q * q) - (f[p] + p * p)) / (2 * q - 2 * p); if (s <= z[k]) k--; else break; } while (k >= 0);
+      k++; v[k] = q; z[k] = s; z[k + 1] = INF;
+    }
+    k = 0;
+    for (let q = 0; q < len; q++) { while (z[k + 1] < q) k++; const p = v[k]; out[q] = (q - p) * (q - p) + f[p]; }
+    for (let q = 0; q < len; q++) set(q, out[q]);
+  };
+  for (let x = 0; x < w; x++) pass(h, y => d[y * w + x], (y, val) => { d[y * w + x] = val; });
+  for (let y = 0; y < h; y++) pass(w, x => d[y * w + x], (x, val) => { d[y * w + x] = val; });
+  return d;
+}
+
+// ---------- shaders ----------
+
+const VERT = `#version 300 es
+void main() { vec2 p = vec2(gl_VertexID & 1, gl_VertexID >> 1) * 4.0 - 1.0; gl_Position = vec4(p, 0.0, 1.0); }`;
+
+const COMMON = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+out vec4 outColor;
+uniform vec2 uRes;
+uniform vec2 uJitter;
+uniform vec2 uLens;
+uniform float uSeed;
+uniform vec3 uCamPos, uCamTarget;
+uniform float uFocal, uAperture, uFocus;
+uniform vec3 uKeyDir, uKeyCol, uFillCol, uRimDir, uRimCol;
+uniform float uDay, uSoft;
+uniform vec3 cBg, cDark, cFg, cAccent, cSecond, cGlaze, cTableA, cTableB, cLeaf, cLiquor, cFoam, cPowder, cSwA, cSwB, cSwC;
+uniform vec3 cBokeh[6];
+uniform float uTable, uIndex, uTopKind, uTopScene, uFoamy;
+uniform sampler2D uLogo;
+uniform vec4 uLogoInfo;
+uniform float uLogoK;
+uniform vec4 uProps[20];
+uniform int uPropCount;
+// uZero is always 0. Loops that start at ZERO do not unroll, and the shader
+// compiles in seconds instead of a minute.
+uniform int uZero;
+#define ZERO min(uZero, 0)
+
+const float PI = 3.14159265;
+
+float hash12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * .1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+vec2 hash22(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * vec3(.1031, .1030, .0973)); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.xx + p3.yz) * p3.zy); }
+float hash13(vec3 p3) { p3 = fract(p3 * .1031); p3 += dot(p3, p3.zyx + 31.32); return fract((p3.x + p3.y) * p3.z); }
+float noise2(vec2 p) { vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash12(i), hash12(i + vec2(1, 0)), u.x), mix(hash12(i + vec2(0, 1)), hash12(i + vec2(1, 1)), u.x), u.y); }
+float noise3(vec3 p) { vec3 i = floor(p), f = fract(p); vec3 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(hash13(i), hash13(i + vec3(1, 0, 0)), u.x), mix(hash13(i + vec3(0, 1, 0)), hash13(i + vec3(1, 1, 0)), u.x), u.y),
+             mix(mix(hash13(i + vec3(0, 0, 1)), hash13(i + vec3(1, 0, 1)), u.x), mix(hash13(i + vec3(0, 1, 1)), hash13(i + vec3(1, 1, 1)), u.x), u.y), u.z); }
+float fbm2(vec2 p) { float s = 0.0, a = .5; for (int i = 0; i < 6; i++) { s += a * noise2(p); p = p * 2.03 + vec2(1.7, 9.2); a *= .5; } return s; }
+// fbm2 on a grid that turns at each octave, so its shapes do not follow the axes.
+float fbmr(vec2 p) { float s = 0.0, a = .5; mat2 m = mat2(.81, -.59, .59, .81); for (int i = 0; i < 5; i++) { s += a * noise2(p); p = m * p * 2.03 + vec2(1.7, 9.2); a *= .5; } return s; }
+float fbm3(vec3 p) { float s = 0.0, a = .5; for (int i = 0; i < 4; i++) { s += a * noise3(p); p = p * 2.07 + vec3(1.7, 9.2, 3.1); a *= .5; } return s; }
+// The nearest point of a jittered grid: its offset from p in xy, and a random
+// number of its cell in z. Round spots, bubbles and holes come from it.
+vec3 nearest(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec3 best = vec3(8.0, 8.0, 0.0);
+  for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+    vec2 o = vec2(x, y), r = o + hash22(i + o) - f;
+    if (dot(r, r) < dot(best.xy, best.xy)) best = vec3(r, hash12(i + o + 17.3));
+  }
+  return best;
+}
+// Round bubbles on a surface: the tilt of a dome over each bubble in xy, and
+// in z 1 on a bubble and 0 off it. density is the share of cells with a bubble.
+vec3 bubbleField(vec2 p, float density, float size) {
+  vec3 c = nearest(p);
+  float rad = size * (.45 + .55 * fract(c.z * 7.3));
+  float d = length(c.xy);
+  float on = step(1.0 - density, c.z) * step(d, rad);
+  return vec3(-c.xy / rad * on, on);
+}
+
+float smin(float a, float b, float k) { float h = max(k - abs(a - b), 0.0) / k; return min(a, b) - h * h * k * .25; }
+float smax(float a, float b, float k) { return -smin(-a, -b, k); }
+mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
+float sdEllipsoid(vec3 p, vec3 r) { float k0 = length(p / r); float k1 = length(p / (r * r)); return k0 * (k0 - 1.0) / k1; }
+float sdCylinder(vec3 p, float h, float r) { vec2 d = abs(vec2(length(p.xz), p.y)) - vec2(r, h); return min(max(d.x, d.y), 0.0) + length(max(d, 0.0)); }
+float sdTorus(vec3 p, vec2 t) { vec2 q = vec2(length(p.xz) - t.x, p.y); return length(q) - t.y; }
+float sdRoundBox(vec3 p, vec3 b, float r) { vec3 q = abs(p) - b + r; return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0) - r; }
+float sdCapsule(vec3 p, vec3 a, vec3 b, float r) { vec3 pa = p - a, ba = b - a; float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0); return length(pa - ba * h) - r; }
+float sdTrapezoid(vec2 p, float r1, float r2, float he) {
+  vec2 k1 = vec2(r2, he), k2 = vec2(r2 - r1, 2.0 * he);
+  p.x = abs(p.x);
+  vec2 ca = vec2(p.x - min(p.x, (p.y < 0.0) ? r1 : r2), abs(p.y) - he);
+  vec2 cb = p - k1 + k2 * clamp(dot(k1 - p, k2) / dot(k2, k2), 0.0, 1.0);
+  float s = (cb.x < 0.0 && ca.y < 0.0) ? -1.0 : 1.0;
+  return s * sqrt(min(dot(ca, ca), dot(cb, cb)));
+}
+vec3 srgb(vec3 c) { return pow(c, vec3(2.2)); }
+
+// Distance to the wordmark in logo units, for a point in logo units.
+float sdLogo2D(vec2 q) {
+  vec2 px = q * uLogoInfo.z + uLogoInfo.w;
+  vec2 uv = px / uLogoInfo.xy;
+  vec2 o = max(max(-uv, uv - 1.0), 0.0) * uLogoInfo.xy / uLogoInfo.z;
+  return texture(uLogo, clamp(uv, 0.0, 1.0)).r + length(o);
+}
+
+vec3 env(vec3 d);
+
+// Soft disc lights far behind the subject, already out of focus.
+vec3 bokeh(vec3 d) {
+  vec3 col = vec3(0.0);
+  float az = atan(d.x, -d.z), el = asin(clamp(d.y, -1.0, 1.0));
+  vec2 g = vec2(az, el) * vec2(11.0, 14.0);
+  for (int j = ZERO - 1; j <= 1; j++) for (int i = ZERO - 1; i <= 1; i++) {
+    vec2 c = floor(g) + vec2(i, j);
+    float h = hash12(c + uIndex * 3.1);
+    if (h < .62) continue;
+    vec2 o = hash22(c + 7.7) * .8 + .1;
+    float r = .22 + hash12(c + 3.3) * .32;
+    float dist = length(g - c - o);
+    float disc = smoothstep(r, r * .82, dist) * (.75 + .25 * smoothstep(r * .5, r, dist));
+    vec3 tint = cBokeh[int(hash12(c + 1.9) * 5.99)];
+    col += disc * tint * (.5 + 1.3 * hash12(c + 5.5));
+  }
+  return col * smoothstep(-.05, .2, d.y);
+}
+
+vec3 env(vec3 d) {
+  vec3 key = normalize(uKeyDir);
+  if (uDay > .5) {
+    vec3 col = mix(vec3(.62, .60, .58), vec3(1.0, .99, .97), smoothstep(-.4, .7, d.y)) * 1.15;
+    col = mix(col, col * cBg * 1.25, .35);
+    float win = smoothstep(.72, .93, dot(d, key));
+    return col + win * vec3(3.4, 3.35, 3.2);
+  }
+  vec3 col = cDark * .18 * (.55 + .45 * d.y);
+  col += smoothstep(.80, .97, dot(d, key)) * uKeyCol * 2.6;
+  col += bokeh(d) * .45;
+  return col;
+}
+
+float ggx(vec3 n, vec3 h, float r) { float a = r * r, a2 = a * a; float nh = max(dot(n, h), 0.0); float d = nh * nh * (a2 - 1.0) + 1.0; return a2 / (PI * d * d); }
+float schlick(float c, float f0) { return f0 + (1.0 - f0) * pow(1.0 - c, 5.0); }
+// A surface for light(). Each scene picks the material of a hit, then calls
+// light() once, so the shadow and occlusion marches compile once.
+struct Mat { vec3 albedo; float rough, f0, metal, sss; vec3 n; };
+`;
+
+// The table under every scene. kind: 0 walnut, 1 slate, 2 marble, 3 linen,
+// 4 oak, 5 dark rosewood. The 3 woods share one grain and differ in color.
+const TABLE = `
+vec3 tableColor(vec3 p, out float rough, out vec3 bump) {
+  rough = .55; bump = vec3(0.0);
+  int kind = int(uTable + .5);
+  if (kind == 0 || kind == 4 || kind == 5) {
+    float plank = floor(p.z / 6.0);
+    vec2 q = vec2(p.x * .035 + plank * 3.7, p.z * .9 + plank * 1.3);
+    float grain = fbm2(vec2(q.x * 4.0, q.y * .25));
+    float rings = sin((grain * 9.0 + p.z * .55 + plank) * 2.2) * .5 + .5;
+    float fine = noise2(vec2(p.x * 3.0, p.z * 40.0));
+    float t = clamp(rings * .55 + fine * .25 + grain * .35, 0.0, 1.0);
+    float seam = smoothstep(.04, 0.0, abs(fract(p.z / 6.0) - .0)) + smoothstep(.04, 0.0, abs(fract(p.z / 6.0) - 1.0));
+    rough = mix(.38, .62, fine) - (kind == 5 ? .12 : 0.0);
+    bump = vec3(0.0, 0.0, (fine - .5) * .05);
+    return mix(cTableA, cTableB, t) * (1.0 - seam * .6);
+  }
+  if (kind == 1) {
+    float n = fbm2(p.xz * .35);
+    rough = .7;
+    bump = vec3((noise2(p.xz * 6.0) - .5) * .06, 0.0, (noise2(p.xz * 6.0 + 9.0) - .5) * .06);
+    return mix(cTableA, cTableB, n);
+  }
+  if (kind == 2) {
+    vec2 q = p.xz * .09;
+    vec2 w = vec2(fbm2(q * 1.3), fbm2(q * 1.3 + 7.1)) * 2.2;
+    float v = abs(fbm2(q * 1.7 + w) - .5);
+    float vein = exp(-v * 40.0) * .65 + exp(-v * 11.0) * .2;
+    rough = .22;
+    return mix(cTableA, cTableB, vein);
+  }
+  float weave = (sin(p.x * 26.0) * .5 + .5) * (sin(p.z * 26.0) * .5 + .5);
+  float slub = noise2(vec2(p.x * 2.0, p.z * 30.0)) * .5 + noise2(vec2(p.x * 30.0, p.z * 2.0)) * .5;
+  rough = .9;
+  bump = vec3((weave - .5) * .05, 0.0, (slub - .5) * .05);
+  return mix(cTableA, cTableB, clamp(weave * .35 + slub * .5, 0.0, 1.0));
+}
+`;
+
+// Dry tea, spices and props. Each shape sits in its own frame, with the long
+// axis on x and up on y. The scenes turn each shape and lift it, so it rests
+// on the table.
+//
+// Kinds: 1 black tea leaf, 2 cornflower petal, 3 cardamom pod, 4 star anise,
+// 5 cinnamon, 6 clove, 7 peppercorn, 8 jasmine pearl, 9 jasmine blossom,
+// 10 CTC tea, 11 bamboo scoop, 12 lemon wheel, 13 small heap of matcha.
+const SHAPES = `
+float sdEllipse2(vec2 p, vec2 r) { float k0 = length(p / r); float k1 = length(p / (r * r)); return k0 * (k0 - 1.0) / max(k1, 1e-6); }
+float sdArc(vec2 p, vec2 sc, float ra, float rb) { p.x = abs(p.x); return ((sc.y * p.x > sc.x * p.y) ? length(p - sc * ra) : abs(length(p) - ra)) - rb; }
+// Folds p around the y axis into the sector that holds the +x axis.
+vec3 polar(vec3 p, float n) {
+  float s = 6.2831853 / n, a = atan(p.z, p.x);
+  a -= floor(a / s + .5) * s;
+  float r = length(p.xz);
+  return vec3(r * cos(a), p.y, r * sin(a));
+}
+
+// A rolled black tea leaf: a thin strip that twists along its length and bows.
+float sdTwist(vec3 p, float len, float r, float tw, float bend) {
+  p.y -= bend * (len * len * .25 - p.x * p.x);
+  p.z -= bend * .8 * p.x * p.x;
+  p.yz = rot(p.x * tw) * p.yz;
+  float h = clamp(p.x / (len * .5), -1.0, 1.0);
+  float rr = r * (.3 + .7 * sqrt(1.0 - h * h));
+  float d = sdEllipse2(p.yz, vec2(rr, rr * .5));
+  return max(d, abs(p.x) - len * .5) * .55;
+}
+
+// A dried cornflower petal: a thin blue strip that widens to a toothed tip.
+float sdPetal(vec3 p) {
+  p.y -= .7 * p.x * p.x;
+  float t = clamp((p.x + .24) / .48, 0.0, 1.0);
+  float w = mix(.025, .1, t);
+  float teeth = .05 * smoothstep(.75, 1.0, t) * abs(fract(p.z * 16.0) - .5) * 2.0;
+  vec3 m = vec3(abs(p.x) - .24 + teeth * step(0.0, p.x), abs(p.y) - .011, abs(p.z) - w);
+  return (length(max(m, 0.0)) + min(max(m.x, max(m.y, m.z)), 0.0) - .006) * .7;
+}
+
+// A green cardamom pod: a spindle with 3 rounded sides and a short stalk.
+float sdCardamom(vec3 p) {
+  float h = clamp(p.x / .46, -1.0, 1.0);
+  float a = atan(p.z, p.y);
+  float r = .25 * pow(max(1.0 - h * h, 0.0), .55) * (1.0 + .09 * cos(3.0 * a));
+  float d = max((length(p.yz) - r) * .6, abs(p.x) - .47);
+  float stalk = sdCapsule(p, vec3(-.43, 0.0, 0.0), vec3(-.55, .02, 0.0), .03);
+  return min(d, stalk);
+}
+
+float gSeed;
+// Star anise: 8 boat-shaped carpels around a hub. Each carpel is open along
+// its top seam and shows a glossy seed.
+float sdStarAnise(vec3 p) {
+  vec3 q = polar(p, 8.0);
+  vec3 c = q - vec3(.43, .1, 0.0);
+  float tip = smoothstep(-.12, .34, c.x);
+  float sy = 1.0 - .55 * tip, sz = 1.0 - .72 * tip;
+  float d = sdEllipsoid(vec3(c.x, c.y / sy, c.z / sz), vec3(.35, .105, .1)) * min(sy, sz);
+  float slit = sdEllipsoid(c - vec3(-.03, .1, 0.0), vec3(.21, .06, .028));
+  d = smax(d, -slit, .015);
+  float seed = sdEllipsoid(c - vec3(-.04, .05, 0.0), vec3(.12, .05, .05));
+  gSeed = step(seed, d);
+  d = min(d, seed);
+  float hub = sdCylinder(p - vec3(0.0, .1, 0.0), .06, .1) - .025;
+  return smin(d, hub, .05) * .8;
+}
+
+// A piece of cinnamon bark, rolled into a double scroll.
+float sdQuill(vec3 p, float len) {
+  vec2 q = vec2(p.z, -p.y);
+  float outer = sdArc(q, vec2(.53, -.848), .27, .022);
+  vec2 q2 = rot(.6) * vec2(p.z + .03, -(p.y + .03));
+  float inner = sdArc(q2, vec2(.643, -.766), .16, .02);
+  float d = min(outer, inner);
+  float ragged = .06 * (noise2(p.yz * 18.0 + sign(p.x) * 3.0) - .5);
+  return max(d, abs(p.x) - len * .5 + ragged);
+}
+
+// A clove: a tapered stem with 4 sepals around a round bud.
+float sdClove(vec3 p) {
+  vec3 pa = p - vec3(-.42, 0.0, 0.0);
+  float hh = clamp(pa.x / .7, 0.0, 1.0);
+  float stem = (length(pa - vec3(.7 * hh, 0.0, 0.0)) - mix(.032, .062, hh)) * .9;
+  vec3 c = p - vec3(.31, 0.0, 0.0);
+  float bud = length(c - vec3(.06, 0.0, 0.0)) - .085;
+  float a = atan(c.z, c.y), s = 6.2831853 / 4.0;
+  a -= floor(a / s + .5) * s;
+  vec3 k = vec3(c.x, length(c.yz) * cos(a), length(c.yz) * sin(a));
+  k.xy = rot(-.6) * k.xy;
+  float sepal = sdEllipsoid(k - vec3(.03, .07, 0.0), vec3(.075, .028, .04));
+  return smin(stem, min(bud, sepal), .025);
+}
+
+// A black peppercorn: a small ball with a wrinkled skin.
+float sdPepper(vec3 p, float r) {
+  float w = abs(noise3(p * 34.0) * 2.0 - 1.0);
+  return (length(p) - r * (1.0 - .07 * w)) * .8;
+}
+// A CTC tea granule: a small rough pellet.
+float sdCtc(vec3 p, float r, float s) {
+  return (length(p) - r * (1.0 + .35 * (noise3(p * 22.0 + s) - .5))) * .8;
+}
+// A jasmine pearl: leaves rolled by hand into a small ball.
+float sdPearl(vec3 p, float r) {
+  return (length(p * vec3(1.0, 1.1, 1.0)) - r - r * .12 * (noise3(p * 7.0) - .5)) * .85;
+}
+// A jasmine blossom: waxy oval petals around a small center, cupped upward.
+float sdBlossom(vec3 p, float n) {
+  vec3 q = polar(p, n);
+  q.y -= .28 * q.x * q.x;
+  float petal = sdEllipsoid(q - vec3(.4, .07, 0.0), vec3(.33, .028, .16));
+  vec3 q2 = polar(vec3(p.x * .87 - p.z * .5, p.y, p.x * .5 + p.z * .87), n);
+  q2.y -= .45 * q2.x * q2.x;
+  float inner = sdEllipsoid(q2 - vec3(.24, .12, 0.0), vec3(.2, .025, .1));
+  float center = length(p - vec3(0.0, .1, 0.0)) - .06;
+  return min(min(petal, inner), center) * .8;
+}
+// A bamboo tea scoop: a thin strip with a node in the middle and a curled tip at +x.
+float sdScoop(vec3 p) {
+  p.y -= .3 * pow(max(p.x - 3.4, 0.0), 2.0);
+  float w = mix(.2, .3, smoothstep(2.6, 4.4, p.x));
+  vec3 m = vec3(abs(p.x) - 4.6, abs(p.y) - .035, abs(p.z) - w);
+  float d = length(max(m, 0.0)) + min(max(m.x, max(m.y, m.z)), 0.0) - .025;
+  float node = sdRoundBox(p - vec3(-.6, .02, 0.0), vec3(.06, .06, w + .015), .035);
+  return min(d, node) * .9;
+}
+float sdLemon(vec3 p) { return sdCylinder(p, .1, 1.05) - .03; }
+// A small heap of matcha powder.
+float sdHeap(vec3 p) {
+  float r = length(p.xz);
+  float h = .55 * pow(clamp(1.0 - r / 1.3, 0.0, 1.0), 1.4) + .04 * (noise2(p.xz * 6.0) - .5);
+  return min((p.y - h) * .6, length(p.xz) - 1.35 + max(p.y, 0.0));
+}
+
+// The shapes of each kind of tea. Each kind compiles only its own shapes, and
+// each layer only the shapes it holds, so the shader stays small and fast.
+// h is a random number of the cell.
+float shapeTwist(vec3 p, float h) {
+  float d = sdTwist(p, .55 + .65 * h, .075 + .04 * fract(h * 7.1), 6.0 + 7.0 * fract(h * 3.3), .08 + .16 * fract(h * 5.7));
+  // Rolling crinkles the leaf.
+  return d + .007 * (noise3(p * 30.0 + h * 9.0) - .5);
+}
+float shapeCardamom(vec3 p, float h) { float s = .92 + .16 * h; return sdCardamom(p / s) * s; }
+float shapeAnise(vec3 p, float h) { float s = 1.0 + .2 * h; return sdStarAnise(p / s) * s; }
+#if LEAF == 0
+float shapeSmall(vec3 p, float k, float h) { return sdHeap(p); }
+float shapeBig(vec3 p, float k, float h) { return sdHeap(p); }
+float shape(vec3 p, float k, float h) { return k < 12.0 ? sdScoop(p) : sdHeap(p); }
+#elif LEAF == 1
+float shapeSmall(vec3 p, float k, float h) { return k < 1.5 ? shapeTwist(p, h) : sdPetal(p); }
+float shapeBig(vec3 p, float k, float h) { return sdPetal(p); }
+float shape(vec3 p, float k, float h) { return k < 1.5 ? shapeTwist(p, h) : k < 2.5 ? sdPetal(p) : sdLemon(p); }
+#elif LEAF == 2
+float shapeSmall(vec3 p, float k, float h) { return k < 3.5 ? shapeCardamom(p, h) : k < 6.5 ? sdClove(p) : sdPepper(p, .13 + .03 * h); }
+float shapeBig(vec3 p, float k, float h) { return k < 4.5 ? shapeAnise(p, h) : sdQuill(p, 2.0 + 1.2 * h); }
+float shape(vec3 p, float k, float h) {
+  if (k < 3.5) return shapeCardamom(p, h);
+  if (k < 4.5) return shapeAnise(p, h);
+  if (k < 5.5) return sdQuill(p, 2.0 + 1.2 * h);
+  if (k < 6.5) return sdClove(p);
+  return sdPepper(p, .13 + .03 * h);
+}
+#else
+float shapeSmall(vec3 p, float k, float h) { return sdPearl(p, .29 + .07 * h); }
+float shapeBig(vec3 p, float k, float h) { return sdBlossom(p, 5.0 + floor(h * 3.0)); }
+float shape(vec3 p, float k, float h) { return k < 8.5 ? sdPearl(p, .29 + .07 * h) : sdBlossom(p, 5.0 + floor(h * 3.0)); }
+#endif
+// Height of the frame of each kind above the table, so the shape rests on it.
+float restY(float k) {
+  if (k < 1.5) return .09;
+  if (k < 2.5) return .02;
+  if (k < 3.5) return .22;
+  if (k < 4.5) return 0.0;
+  if (k < 5.5) return .28;
+  if (k < 6.5) return .06;
+  if (k < 7.5) return .13;
+  if (k < 8.5) return .3;
+  if (k < 9.5) return -.01;
+  if (k < 10.5) return .1;
+  if (k < 11.5) return .06;
+  if (k < 12.5) return .13;
+  return 0.0;
+}
+// A simple shape around each kind, in its own frame: a sphere, a capsule
+// or a disc. Away from it, the march uses the distance to it. The bound
+// follows the shape closely, so soft shadows and occlusion show no halos.
+float capsuleX(vec3 p, float hl, float r) { return length(vec3(max(abs(p.x) - hl, 0.0), p.yz)) - r; }
+float boundOf(vec3 p, float k) {
+  if (k < 1.5) return capsuleX(p, .62, .2);
+  if (k < 2.5) return capsuleX(p, .22, .12);
+  if (k < 3.5) return capsuleX(p, .32, .32);
+  if (k < 4.5) return sdCylinder(p - vec3(0.0, .1, 0.0), .16, .96);
+  if (k < 5.5) return capsuleX(p, 1.58, .34);
+  if (k < 6.5) return capsuleX(p, .42, .14);
+  if (k < 7.5) return length(p) - .17;
+  if (k < 8.5) return length(p) - .41;
+  if (k < 9.5) return sdCylinder(p - vec3(0.0, .1, 0.0), .16, .82);
+  if (k < 10.5) return length(p) - .18;
+  if (k < 11.5) return sdRoundBox(p, vec3(4.7, .4, .36), .3);
+  if (k < 12.5) return sdCylinder(p, .15, 1.1);
+  return sdCylinder(p - vec3(0.0, .3, 0.0), .32, 1.4);
+}
+float tiltOf(float k) {
+  if (k < 1.5) return .3;
+  if (k < 3.5) return .3;
+  if (k < 5.5) return .12;
+  if (k < 6.5) return .3;
+  if (k < 8.5) return 0.0;
+  if (k < 9.5) return .25;
+  return 0.0;
+}
+
+// The nearest shape so far. Each field updates these only when it finds a
+// shape that is nearer, so the shading reads the right shape.
+float gBest, gKind, gTone;
+vec3 gLocal;
+#define CONSIDER(NAME, FN) void NAME(vec3 lp, float k, float h, float turn, float tilt) { lp.xz = rot(turn) * lp.xz; lp.xy = rot(tilt * tiltOf(k)) * lp.xy; float bound = boundOf(lp, k); if (bound > .06) { gBest = min(gBest, bound); return; } float d = FN(lp, k, h); if (d < gBest) { gBest = d; gKind = k; gTone = h; gLocal = lp; } }
+CONSIDER(considerSmall, shapeSmall)
+CONSIDER(considerBig, shapeBig)
+CONSIDER(consider, shape)
+`;
+
+// The march, the normal, shadows and ambient occlusion, shared by the scenes.
+// Each scene defines vec2 map(vec3 p) and vec3 render(...).
+const MARCH = `
+vec2 march(vec3 ro, vec3 rd, float tmax) {
+  float t = .02, id = -1.0;
+  for (int i = ZERO; i < 200; i++) {
+    vec2 h = map(ro + rd * t);
+    if (h.x < .0006 * t) { id = h.y; break; }
+    t += h.x * .9;
+    if (t > tmax) break;
+  }
+  return vec2(t, id);
+}
+vec3 calcNormal(vec3 p, float t) {
+  float e = .0005 * max(t, 1.0);
+  vec3 n = vec3(0.0);
+  // A loop instead of 4 calls, so map() compiles once here.
+  for (int i = ZERO; i < 4; i++) {
+    vec3 k = .5773 * (2.0 * vec3((((i + 3) >> 1) & 1), ((i >> 1) & 1), (i & 1)) - 1.0);
+    n += k * map(p + k * e).x;
+  }
+  return normalize(n);
+}
+float softShadow(vec3 ro, vec3 rd, float k) {
+  float res = 1.0, t = .02, ph = 1e10;
+  for (int i = ZERO; i < 56; i++) {
+    float h = map(ro + rd * t).x;
+    if (h < .0005) return 0.0;
+    float y = h * h / (2.0 * ph), d = sqrt(max(h * h - y * y, 0.0));
+    res = min(res, k * d / max(0.0, t - y));
+    if (res < .02) return 0.0;
+    ph = h; t += clamp(h, .02, .6);
+    if (t > 25.0) break;
+  }
+  return clamp(res, 0.0, 1.0);
+}
+float ambientOcclusion(vec3 p, vec3 n) {
+  float occ = 0.0, sca = 1.0;
+  for (int i = ZERO; i < 5; i++) { float h = .02 + .11 * float(i); occ += (h - map(p + h * n).x) * sca; sca *= .8; }
+  return clamp(1.0 - 2.2 * occ, 0.0, 1.0);
+}
+// Daylight comes through a window, so the frame casts soft bars of shadow.
+float windowPanes(vec3 p, vec3 key) {
+  vec3 t1 = normalize(cross(key, vec3(0.0, 0.0, 1.0))), t2 = cross(key, t1);
+  vec2 lc = vec2(dot(p, t1), dot(p, t2)) / 9.0 - vec2(.15, .1);
+  vec2 a = abs(lc);
+  float inside = (1.0 - smoothstep(.95, 1.15, a.x)) * (1.0 - smoothstep(1.2, 1.45, a.y));
+  float bars = max(1.0 - smoothstep(.02, .07, a.x), 1.0 - smoothstep(.02, .07, a.y));
+  return mix(.62, 1.0, inside * (1.0 - bars * .8));
+}
+// Light on a surface: a soft key light, a rim light, the room and reflections.
+vec3 light(vec3 p, vec3 n, vec3 rd, vec3 albedo, float rough, float f0, float metal, float sss) {
+  vec3 key = normalize(uKeyDir), rim = normalize(uRimDir), v = -rd;
+  float sh = softShadow(p + n * .004, key, uSoft);
+  if (uDay > .5) sh *= windowPanes(p, key);
+  float ao = ambientOcclusion(p, n);
+  float nl = dot(n, key);
+  float diff = max(nl, 0.0) * sh;
+  float wrap = max((nl + sss) / (1.0 + sss), 0.0) * mix(1.0, sh, .7);
+  vec3 h = normalize(key + v);
+  float nv = max(dot(n, v), 1e-3);
+  float fr = schlick(nv, f0);
+  vec3 spec = vec3(ggx(n, h, rough) * schlick(max(dot(h, v), 0.0), f0)) * diff;
+  vec3 specCol = mix(vec3(1.0), albedo, metal);
+  float rimL = pow(max(dot(n, rim), 0.0), 2.0) * pow(1.0 - nv, 1.5);
+  vec3 col = albedo * (1.0 - metal) * (uKeyCol * mix(diff, wrap, sss > 0.0 ? 1.0 : 0.0) + uFillCol * ao * (.6 + .4 * n.y));
+  col += specCol * uKeyCol * spec;
+  col += uRimCol * rimL * ao * (.6 + .4 * (1.0 - rough));
+  vec3 refl = env(reflect(rd, n));
+  col += refl * specCol * fr * ao * (1.0 - rough * .85) * mix(.6, 1.0, metal);
+  return col;
+}
+`;
+
+// The camera and the accumulation of one sample.
+const MAIN = `
+void main() {
+  vec3 ro = uCamPos;
+  vec3 ww = normalize(uCamTarget - ro), uu = normalize(cross(ww, vec3(0, 1, 0))), vv = cross(uu, ww);
+  // Each pixel turns the lens pattern by its own random angle, so the blur
+  // becomes fine grain instead of stacked copies of each edge.
+  float spin = hash12(gl_FragCoord.xy * .713 + 3.1) * 6.2831;
+  vec2 lens = rot(spin) * uLens;
+  vec2 jit = fract(uJitter + hash22(gl_FragCoord.xy * .291)) - .5;
+  vec2 p = (2.0 * (gl_FragCoord.xy + jit) - uRes) / uRes.y;
+  vec3 rd = normalize(p.x * uu + p.y * vv + uFocal * ww);
+  vec3 fp = ro + rd * (uFocus / dot(rd, ww));
+  ro += (uu * lens.x + vv * lens.y) * uAperture;
+  rd = normalize(fp - ro);
+  vec3 col = render(ro, rd);
+  outColor = vec4(max(col, 0.0), 1.0);
+}`;
+
+// Color, roughness and the rest of the material of each shape. Call map() at
+// the point first, so gKind, gTone and gLocal belong to it.
+const SHADE_SHAPE = `
+Mat powderMat(vec3 pos, vec3 n, vec3 rd, float tone) {
+  // Fine grain and small clumps. Powder scatters light back toward the
+  // camera, so the edges of a mound look a little lighter, like velvet.
+  vec3 bump = vec3(noise3(pos * 90.0), noise3(pos * 90.0 + 5.0), noise3(pos * 90.0 + 9.0)) - .5;
+  n = normalize(n + bump * .35);
+  float clump = smoothstep(.55, .8, fbm3(pos * 9.0));
+  vec3 albedo = cPowder * (.86 + .22 * noise3(pos * 40.0) + .1 * tone) * (1.0 - clump * .12);
+  float nv = max(dot(n, -rd), 0.0);
+  albedo *= 1.0 + .35 * pow(1.0 - nv, 2.0);
+  return Mat(albedo, .95, .02, 0.0, .15, n);
+}
+Mat shapeMat(vec3 pos, vec3 n, vec3 rd) {
+  float k = gKind, tone = gTone; vec3 lp = gLocal;
+  vec3 bump = vec3(fbm3(pos * 30.0), fbm3(pos * 30.0 + 4.0), fbm3(pos * 30.0 + 8.0)) - .5;
+  vec3 albedo; float rough = .7, sss = 0.0, f0 = .035, amt = .35;
+  if (k < 1.5) {
+    // Black tea: near black with brown and copper tones, a little oily
+    // Most pieces are near black. A few are brown, and a few have golden tips.
+    vec3 base = mix(cLeaf, cLeaf * vec3(2.4, 1.7, 1.2), smoothstep(.6, .95, tone));
+    base = mix(base, srgb(vec3(.55, .36, .16)), step(.93, fract(tone * 13.7)) * smoothstep(.15, .5, abs(lp.x)));
+    // Fine creases run along the rolled leaf.
+    float crease = noise3(vec3(lp.x * 4.0, lp.y * 70.0, lp.z * 70.0));
+    albedo = base * (.7 + .6 * fbm3(pos * 9.0)) * (.75 + .5 * crease);
+    rough = .42 + .2 * noise3(pos * 20.0); amt = .6;
+  } else if (k < 2.5) {
+    albedo = srgb(vec3(.2, .33, .78)) * (.75 + .45 * fbm3(pos * 18.0));
+    sss = .6; rough = .6; amt = .2;
+  } else if (k < 3.5) {
+    // Cardamom: sage green with fine lines along the pod
+    float a = atan(lp.z, lp.y);
+    float lines = .5 + .5 * sin(a * 26.0 + noise3(lp * 9.0) * 2.0);
+    albedo = srgb(vec3(.58, .62, .38)) * (.8 + .3 * fbm3(pos * 5.0)) * (.88 + .16 * lines) * mix(.85, 1.1, tone);
+    rough = .78;
+  } else if (k < 4.5) {
+    float s = 1.0 + .2 * tone;
+    sdStarAnise(lp / s);
+    if (gSeed > .5) { albedo = srgb(vec3(.55, .3, .14)); rough = .22; amt = .05; }
+    else { albedo = srgb(vec3(.42, .2, .1)) * (.7 + .55 * fbm3(pos * 12.0)); rough = .85; amt = .6; }
+  } else if (k < 5.5) {
+    // Cinnamon: rough bark outside, smoother and lighter inside the roll
+    float r = length(lp.yz);
+    float lines = noise3(vec3(lp.x * 4.0, lp.y * 60.0, lp.z * 60.0));
+    albedo = (r > .2 ? srgb(vec3(.5, .27, .14)) : srgb(vec3(.62, .36, .2))) * (.75 + .4 * fbm3(pos * 8.0)) * (.85 + .25 * lines);
+    rough = .85; amt = .5;
+  } else if (k < 6.5) {
+    albedo = (lp.x > .24 ? srgb(vec3(.4, .23, .13)) : srgb(vec3(.3, .15, .08))) * (.75 + .45 * fbm3(pos * 14.0));
+    rough = .6;
+  } else if (k < 7.5) {
+    albedo = srgb(vec3(.2, .16, .13)) * (.6 + .6 * fbm3(pos * 20.0));
+    rough = .55; amt = .6;
+  } else if (k < 8.5) {
+    // A jasmine pearl: olive leaf with silver down along the rolled seams
+    float a = atan(lp.z, lp.x) + lp.y * 7.0 + fbm3(lp * 4.0) * 3.0;
+    float seam = smoothstep(.85, .98, sin(a * 3.0));
+    float down = smoothstep(.45, .75, fbm3(lp * 9.0 + gTone * 7.0));
+    vec3 leaf = mix(srgb(vec3(.36, .38, .24)), srgb(vec3(.5, .5, .36)), noise3(lp * 14.0));
+    albedo = mix(leaf, srgb(vec3(.86, .86, .8)), down * .75) * (1.0 - seam * .45) * (.88 + .2 * tone);
+    rough = mix(.7, .9, down); amt = .5;
+  } else if (k < 9.5) {
+    // A jasmine blossom: waxy ivory petals with a pale green heart
+    float r = length(lp.xz);
+    albedo = mix(srgb(vec3(.72, .78, .5)), srgb(vec3(.97, .95, .9)), smoothstep(.06, .2, r));
+    albedo *= .92 + .1 * noise3(pos * 12.0);
+    sss = .9; rough = .42; amt = .08;
+  } else if (k < 10.5) {
+    albedo = srgb(vec3(.2, .12, .07)) * (.65 + .6 * fbm3(pos * 24.0));
+    rough = .9; amt = .6;
+  } else if (k < 11.5) {
+    // Bamboo: pale straw with fine fibers and a darker node
+    float fiber = noise3(vec3(lp.x * 3.0, lp.y * 90.0, lp.z * 90.0));
+    albedo = srgb(vec3(.78, .66, .44)) * (.85 + .2 * fiber) * (1.0 - .35 * smoothstep(.12, 0.0, abs(lp.x + .6)));
+    rough = .45; amt = .1;
+  } else if (k < 12.5) {
+    vec3 w = lp;
+    float a = atan(w.z, w.x), r = length(w.xz);
+    float seg = smoothstep(.8, .95, abs(sin(a * 4.5)));
+    albedo = mix(srgb(vec3(.98, .88, .38)), srgb(vec3(.99, .97, .82)), max(seg, smoothstep(.2, .1, r)));
+    albedo = mix(albedo, srgb(vec3(.95, .8, .1)), smoothstep(.92, 1.0, r / 1.05));
+    rough = .35; sss = .5; amt = .05;
+  } else {
+    return powderMat(pos, n, rd, tone);
+  }
+  return Mat(albedo, rough, f0, 0.0, sss, normalize(n + bump * amt));
+}
+Mat tableMat(vec3 pos, vec3 n) {
+  float rough; vec3 bump;
+  vec3 albedo = tableColor(pos, rough, bump);
+  return Mat(albedo, rough, .035, 0.0, 0.0, normalize(n + bump));
+}
+vec3 shade(vec3 pos, vec3 rd, Mat m) { return light(pos, m.n, rd, m.albedo, m.rough, m.f0, m.metal, m.sss); }
+`;
+
+// ---------- scenes ----------
+
+const SCENES = {};
+
+// The fields of dry tea for the leaves and the wordmark scenes. Each field is
+// a grid of cells, and each cell holds 1 shape at a random place, turn and
+// tilt. word is 1 in the wordmark scene: shapes fill the letters only.
+const FIELDS = `
+#if LEAF == 1
+const float CELL = .64, LIFT = .15, TOPY = .55;
+float pickSmall(float h) { return h < .07 ? 2.0 : 1.0; }
+float pickBig(float h) { return -1.0; }
+#elif LEAF == 2
+const float CELL = .78, LIFT = .3, TOPY = 1.15;
+float pickSmall(float h) { return h < .46 ? 3.0 : h < .7 ? 6.0 : 7.0; }
+float pickBig(float h) { return h < .32 ? 4.0 : h < .5 ? 5.0 : -1.0; }
+#else
+const float CELL = .76, LIFT = .44, TOPY = 1.1;
+float pickSmall(float h) { return 8.0; }
+float pickBig(float h) { return h < .3 ? 9.0 : -1.0; }
+#endif
+
+// Distance from the center of a cell to the letters, in logo units.
+float letters(vec2 center) { return sdLogo2D(center * uLogoK + vec2(607.5, 142.5)); }
+
+void smallLayer(vec3 p, float layer, float lift, float word) {
+  float off = layer * CELL * .5;
+  vec2 q = (p.xz + off) / CELL;
+  vec2 base = floor(q) - 1.0;
+  for (int j = ZERO; j < 3; j++) for (int i = ZERO; i < 3; i++) {
+    vec2 c = base + vec2(i, j);
+    vec2 hv = hash22(c + layer * 31.7 + uIndex * 1.3);
+    vec2 center = (c + .5 + (hv - .5) * .55) * CELL - off;
+    float h = hash12(c * 5.3 + layer * 13.1 + 2.0);
+    if (word > .5) {
+      float inside = letters(center);
+      if (layer < .5 && inside > -4.0 && hash12(c * 5.3) > .01) continue;
+      if (layer > .5 && (inside > -10.0 || hash12(c * 2.3 + 9.0) > .5)) continue;
+    } else if (layer > .5 && hash12(c * 2.3 + 11.0) > (LEAF == 1 ? .75 : .5)) continue;
+    float k = pickSmall(h);
+    vec3 lp = p - vec3(center.x, restY(k) + lift, center.y);
+    considerSmall(lp, k, h, hash12(c * 4.1 + layer) * 6.2831 + 1.0, hash12(c * 9.3 + layer) - .5);
+  }
+}
+#if LEAF != 1
+void bigLayer(vec3 p, float lift, float word) {
+  const float BIG = 2.4;
+  vec2 q = p.xz / BIG;
+  vec2 base = floor(q) - 1.0;
+  for (int j = ZERO; j < 3; j++) for (int i = ZERO; i < 3; i++) {
+    vec2 c = base + vec2(i, j);
+    vec2 hv = hash22(c * 1.7 + 4.4 + uIndex);
+    vec2 center = (c + .5 + (hv - .5) * .5) * BIG;
+    float h = hash12(c * 7.7 + 3.0);
+    float k = pickBig(h);
+    if (k < 0.0) continue;
+    // In the wordmark scene, a few big shapes lie near the letters.
+    if (word > .5 && (letters(center) < 8.0 || hash12(c * 3.1) > .12)) continue;
+    vec3 lp = p - vec3(center.x, restY(k) + lift, center.y);
+    considerBig(lp, k, h, hash12(c * 6.3) * 6.2831 + 2.0, hash12(c * 8.1) - .5);
+  }
+}
+#endif
+#if LEAF == 2
+// A bed of CTC tea under the whole spices: small round pellets.
+void ctcLayer(vec3 p) {
+  const float C = .3;
+  for (int layer = ZERO; layer < 2; layer++) {
+    float off = float(layer) * C * .5;
+    vec2 q = (p.xz + off) / C;
+    vec2 base = floor(q) - 1.0;
+    for (int j = ZERO; j < 3; j++) for (int i = ZERO; i < 3; i++) {
+      vec2 c = base + vec2(i, j);
+      vec2 hv = hash22(c + float(layer) * 17.3);
+      vec2 center = (c + .5 + (hv - .5) * .6) * C - off;
+      float h = hash12(c * 3.3 + float(layer));
+      vec3 lp = p - vec3(center.x, .1 + float(layer) * .12, center.y);
+      float bound = length(lp) - .18;
+      if (bound > .06) { gBest = min(gBest, bound); continue; }
+      float d = sdCtc(lp, .1 + .05 * h, h * 17.0);
+      if (d < gBest) { gBest = d; gKind = 10.0; gTone = h; gLocal = lp; }
+    }
+  }
+}
+#endif
+`;
+
+SCENES.leaves = `
+${FIELDS}
+#if LEAF == 0
+// A mound of matcha powder with lumps, and a little dust around it.
+const vec2 MOUND = vec2(.8, -1.6);
+float moundH(vec2 q) {
+  vec2 d = q - MOUND;
+  float r = length(d * vec2(1.0, 1.2));
+  float h = 2.3 * pow(clamp(1.0 - r / 4.8, 0.0, 1.0), 1.15) * (1.0 + .08 * (fbm2(q * 1.3) - .5));
+  h += .16 * pow(fbm2(q * 3.1 + 4.0), 3.0) * smoothstep(5.0, 2.6, r);
+  h += .02 * smoothstep(.55, .8, fbm2(q * 3.4)) * smoothstep(6.4, 4.6, r);
+  return h;
+}
+#endif
+vec2 map(vec3 p) {
+  vec2 res = vec2(p.y, 1.0);
+#if LEAF == 0
+  if (p.y < 2.9) {
+    // Where no powder lies, the table shows.
+    float hg = moundH(p.xz);
+    if (hg > .004) res = vec2((p.y - hg) * .5, 6.0);
+  } else res.x = min(res.x, p.y - 2.5);
+  gBest = 1e9;
+  for (int i = ZERO; i < 20; i++) {
+    if (i >= uPropCount) break;
+    vec4 b = uProps[i];
+    vec3 lp = p - vec3(b.x, restY(b.w) + moundH(b.xy) * .9, b.y);
+    consider(lp, b.w, fract(b.z), b.z, 0.0);
+  }
+  if (gBest < res.x) res = vec2(gBest, 4.0);
+#else
+  if (p.y < TOPY + .4) {
+    gBest = 1e9;
+#if LEAF == 2
+    ctcLayer(p);
+    smallLayer(p, 0.0, .18, 0.0);
+    smallLayer(p, 1.0, .18 + LIFT, 0.0);
+    bigLayer(p, .3 + LIFT, 0.0);
+#elif LEAF == 3
+    smallLayer(p, 0.0, 0.0, 0.0);
+    smallLayer(p, 1.0, LIFT, 0.0);
+    bigLayer(p, LIFT, 0.0);
+#else
+    smallLayer(p, 0.0, 0.0, 0.0);
+    smallLayer(p, 1.0, LIFT, 0.0);
+#endif
+    if (gBest < res.x) res = vec2(gBest, 4.0);
+  } else res.x = min(res.x, p.y - TOPY);
+#endif
+  return res;
+}
+${MARCH}
+${SHADE_SHAPE}
+vec3 render(vec3 ro, vec3 rd) {
+  vec2 h = march(ro, rd, 90.0);
+  if (h.y < 0.0) return env(rd);
+  vec3 pos = ro + rd * h.x, n = calcNormal(pos, h.x);
+  Mat m;
+  if (h.y > 5.5) m = powderMat(pos, n, rd, 0.0);
+  else if (h.y > 3.5) { map(pos); m = shapeMat(pos, n, rd); }
+  else m = tableMat(pos, n);
+  return shade(pos, rd, m);
+}
+${MAIN}`;
+
+// The Omarchy wordmark spelled in the dry tea on a table. Matcha is sifted
+// through a stencil, so its letters are a thin layer of powder.
+SCENES.wordmark = `
+${FIELDS}
+#if LEAF == 0
+float stencilH(vec2 q) {
+  // A thin, uneven layer of powder with soft edges, like matcha sifted
+  // through a stencil
+  float d = letters(q) / uLogoK + .16 * (fbm2(q * 2.6) - .5);
+  float h = .045 * smoothstep(.35, -.35, d) * (.65 + .7 * fbm2(q * 4.0)) * (.85 + .3 * noise2(q * 24.0));
+  // Fine dust lands just outside the letters.
+  h += .02 * step(.9, hash12(floor(q * 16.0))) * smoothstep(1.2, 0.0, d) * step(0.0, d);
+  return h;
+}
+#endif
+vec2 map(vec3 p) {
+  vec2 res = vec2(p.y, 1.0);
+#if LEAF == 0
+  if (p.y < .3) {
+    // Where no powder lies, the table shows.
+    float hg = stencilH(p.xz);
+    if (hg > .004) res = vec2((p.y - hg) * .55, 6.0);
+  } else res.x = min(res.x, p.y - .2);
+  gBest = 1e9;
+  for (int i = ZERO; i < 20; i++) {
+    if (i >= uPropCount) break;
+    vec4 b = uProps[i];
+    consider(p - vec3(b.x, restY(b.w), b.y), b.w, fract(b.z), b.z, 0.0);
+  }
+  if (gBest < res.x) res = vec2(gBest, 4.0);
+#else
+  if (p.y < TOPY + .4) {
+    gBest = 1e9;
+    smallLayer(p, 0.0, 0.0, 1.0);
+    smallLayer(p, 1.0, LIFT, 1.0);
+#if LEAF != 1
+    bigLayer(p, 0.0, 1.0);
+#endif
+    if (gBest < res.x) res = vec2(gBest, 4.0);
+  } else res.x = min(res.x, p.y - TOPY);
+#endif
+  return res;
+}
+${MARCH}
+${SHADE_SHAPE}
+vec3 render(vec3 ro, vec3 rd) {
+  vec2 h = march(ro, rd, 140.0);
+  if (h.y < 0.0) return env(rd);
+  vec3 pos = ro + rd * h.x, n = calcNormal(pos, h.x);
+  Mat m;
+  if (h.y > 5.5) m = powderMat(pos, n, rd, 0.0);
+  else if (h.y > 3.5) { map(pos); m = shapeMat(pos, n, rd); }
+  else m = tableMat(pos, n);
+  return shade(pos, rd, m);
+}
+${MAIN}`;
+
+// Cups and bowls: a turned profile with a wall, an optional handle, foot
+// ring and saucer, and the tea inside with its surface at the given level.
+const VESSEL = `
+uniform vec3 uCupPos;
+uniform vec4 uCup;       // bottom radius, top radius, height, wall
+uniform vec4 uCupFlags;  // handle, saucer, gold rim, liquid level 0-1
+uniform vec4 uCupMore;   // saucer radius, handle angle, material, foot height
+uniform vec4 uSpoon;     // x, z, angle, on (1) or off (0)
+uniform float uBulge, uFootR;
+float profileBulge(float y) { return uBulge * sin(PI * clamp(y / uCup.z, 0.0, 1.0)); }
+float sdOuter(vec3 q) {
+  vec2 q2 = vec2(length(q.xz) - profileBulge(q.y), q.y - uCup.z * .5);
+  return sdTrapezoid(q2, uCup.x, uCup.y, uCup.z * .5) - .05;
+}
+float sdInner(vec3 q) {
+  vec2 q2 = vec2(length(q.xz) - profileBulge(q.y), q.y - uCup.z * .5 - uCup.w);
+  return sdTrapezoid(q2, uCup.x - uCup.w, uCup.y - uCup.w, uCup.z * .5);
+}
+vec3 innerNormal(vec3 q) {
+  vec2 k = vec2(1, -1); float e = .002;
+  return normalize(k.xyy * sdInner(q + k.xyy * e) + k.yyx * sdInner(q + k.yyx * e) + k.yxy * sdInner(q + k.yxy * e) + k.xxx * sdInner(q + k.xxx * e));
+}
+float sdShell(vec3 q) {
+  float d = smax(sdOuter(q), -sdInner(q), .04);
+  if (uCupFlags.x > .5) {
+    vec3 h = q - vec3(0.0, uCup.z * .55, 0.0);
+    h.xz = rot(uCupMore.y) * h.xz;
+    h -= vec3(uCup.y * .95 + .55, 0.0, 0.0);
+    float t = sdTorus(h.xzy, vec2(uCup.z * .26, .15 + uCup.z * .012));
+    t = max(t, -sdOuter(q) - .02);
+    d = smin(d, t, .12);
+  }
+  if (uFootR > 0.0) d = smin(d, sdCylinder(q + vec3(0.0, uCupMore.w * .5, 0.0), uCupMore.w * .5, uFootR) - .04, .15);
+  return d;
+}
+float liquidTop() { return uCup.w + (uCup.z - uCup.w) * uCupFlags.w; }
+float sdLiquid(vec3 q) { return max(sdInner(q) + .01, q.y - liquidTop()); }
+// Radius of the surface of the tea.
+float liquidR() { float y = liquidTop(); return uCup.x - uCup.w + (uCup.y - uCup.x) * (y - uCup.w) / uCup.z + profileBulge(y); }
+float sdSaucer(vec3 q) {
+  float R = uCupMore.x;
+  float plate = sdCylinder(q - vec3(0.0, .09, 0.0), .09, R - .25);
+  float rim = sdTorus(q - vec3(0.0, .3, 0.0), vec2(R - .32, .26));
+  float d = smin(plate, rim, .5);
+  return smax(d, -sdCylinder(q - vec3(0.0, .42, 0.0), .2, R - .62), .25);
+}
+// The base of the cup: the saucer top, or the table.
+float baseY() { return uCupFlags.y > .5 ? .18 : 0.0; }
+// The cup frame: the bottom of the bowl, above the foot ring.
+vec3 cupFrame(vec3 p) { return p - uCupPos - vec3(0.0, baseY() + uCupMore.w, 0.0); }
+float sdUnevenCapsule(vec2 p, float r1, float r2, float h) {
+  p.x = abs(p.x);
+  float b = (r1 - r2) / h, a = sqrt(1.0 - b * b), k = dot(p, vec2(-b, a));
+  if (k < 0.0) return length(p) - r1;
+  if (k > a * h) return length(p - vec2(0.0, h)) - r2;
+  return dot(p, vec2(a, b)) - r1;
+}
+float sdSpoon(vec3 p) {
+  vec3 q = p - vec3(uSpoon.x, 0.0, uSpoon.y);
+  q.xz = rot(uSpoon.z) * q.xz;
+  q.y -= .12;
+  float bowl = sdEllipsoid(q, vec3(.8, .16, .52));
+  bowl = smax(bowl, -sdEllipsoid(q - vec3(0.0, .13, 0.0), vec3(.73, .14, .46)), .02);
+  float y = q.y - .02 - .02 * max(q.x - .7, 0.0);
+  float d2 = sdUnevenCapsule(vec2(q.z, q.x - .7), .07, .17, 3.7);
+  vec2 w = vec2(d2, abs(y) - .025);
+  float handle = min(max(w.x, w.y), 0.0) + length(max(w, 0.0)) - .012;
+  return smin(bowl, handle, .08);
+}
+`;
+
+// The tea in its cup with props on the table. The top scene uses it from
+// straight above, and the float scene from close up.
+// uTopKind: 0 matcha foam, 1 clear tea, 2 milky chai.
+SCENES.cup = `
+${VESSEL}
+vec2 map(vec3 p) {
+  vec2 res = vec2(p.y, 1.0);
+  vec3 q = p - uCupPos;
+  if (uCupFlags.y > .5) { float s = sdSaucer(q); if (s < res.x) res = vec2(s, 2.5); }
+  vec3 cq = cupFrame(p);
+  float s = sdShell(cq); if (s < res.x) res = vec2(s, 2.0);
+  // Clear tea is not in the march. render() finds its surface on a plane.
+  if (abs(uTopKind - 1.0) > .5) { float l = sdLiquid(cq); if (l < res.x) res = vec2(l, 3.0); }
+  gBest = 1e9;
+  float top = uCupPos.y + baseY() + uCupMore.w + liquidTop();
+  for (int i = ZERO; i < 20; i++) {
+    if (i >= uPropCount) break;
+    vec4 b = uProps[i];
+    // A negative kind floats on the tea.
+    float k = abs(b.w);
+    float y = b.w < 0.0 ? top - .03 : (uCupFlags.y > .5 && length(b.xy - uCupPos.xz) < uCupMore.x - .5 ? baseY() + .06 : 0.0) + restY(k);
+    consider(p - vec3(b.x, y, b.y), k, fract(b.z), b.z, 0.0);
+  }
+  if (gBest < res.x) res = vec2(gBest, 4.0);
+  if (uSpoon.w > .5) { vec3 sp = p - vec3(0.0, uCupFlags.y > .5 ? .26 : 0.0, 0.0); float d = sdSpoon(sp); if (d < res.x) res = vec2(d, 5.0); }
+  return res;
+}
+${MARCH}
+${SHADE_SHAPE}
+// The glaze of the cup. m: 2 terracotta, 4 raku or shino, 5 porcelain.
+vec3 vesselAlbedo(vec3 pos, bool saucer, inout vec3 n, out float rough, out float f0, out float metal) {
+  vec3 q = pos - uCupPos, cq = cupFrame(pos);
+  int m = int(uCupMore.z + .5);
+  vec3 albedo = cGlaze; rough = .1; f0 = .05; metal = 0.0;
+  if (m == 2) {
+    // Unglazed terracotta with the rings of the potter's wheel
+    float ring = sin(cq.y * 28.0 + fbm3(pos * 1.5) * 4.0);
+    albedo = srgb(vec3(.66, .36, .22)) * (.78 + .38 * fbm3(pos * 4.0)) * (.95 + .05 * ring);
+    albedo = mix(albedo, albedo * vec3(.8, .78, .75), smoothstep(.55, .8, fbm3(pos * 9.0)) * .5);
+    rough = .86; f0 = .03;
+    n = normalize(n + vec3(0.0, ring * .04, 0.0) + (vec3(noise3(pos * 40.0), noise3(pos * 40.0 + 3.0), noise3(pos * 40.0 + 7.0)) - .5) * .12);
+  } else if (m == 4) {
+    if (uDay < .5) {
+      // Black raku: glossy black, with faint brown where the glaze is thin
+      float patchy = smoothstep(.6, .85, fbm3(pos * 1.6));
+      albedo = mix(srgb(vec3(.06, .055, .05)), srgb(vec3(.2, .12, .07)), patchy * .7);
+      rough = mix(.08, .3, patchy);
+    } else {
+      // Shino: a thick cream glaze with orange flashes and pinholes
+      float flash = smoothstep(.5, .8, fbm3(pos * 1.3 + 3.0));
+      albedo = mix(srgb(vec3(.9, .86, .78)), srgb(vec3(.86, .58, .38)), flash * .65);
+      vec3 hole = nearest(vec2(atan(cq.z, cq.x) * 9.0, cq.y * 3.0) * 4.0);
+      albedo *= 1.0 - step(.9, hole.z) * smoothstep(.14, .05, length(hole.xy)) * .45;
+      rough = .3; f0 = .045;
+    }
+    n = normalize(n + (vec3(fbm3(pos * 6.0), 0.0, fbm3(pos * 6.0 + 5.0)) - .5) * .05);
+  } else {
+    // Porcelain, with a gold rim on the teacup and its saucer
+    float rim = saucer ? step(uCupMore.x - .5, length(q.xz)) : step(uCup.z - .12, cq.y) * step(.0, sdInner(cq) - .02);
+    if (uCupFlags.z > .5 && rim > .5) { albedo = srgb(vec3(.93, .74, .38)); metal = 1.0; rough = .2; }
+  }
+  return albedo;
+}
+Mat vesselMat(vec3 pos, vec3 n, bool saucer) {
+  float rough, f0, metal;
+  vec3 albedo = vesselAlbedo(pos, saucer, n, rough, f0, metal);
+  return Mat(albedo, rough, f0, metal, 0.0, n);
+}
+// The cell pattern of foam: distance to the nearest and the next point.
+vec2 cells(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  float d1 = 8.0, d2 = 8.0;
+  for (int y = ZERO - 1; y <= 1; y++) for (int x = ZERO - 1; x <= 1; x++) {
+    vec2 o = vec2(x, y), r = o + hash22(i + o) - f;
+    float d = dot(r, r);
+    if (d < d1) { d2 = d1; d1 = d; } else if (d < d2) d2 = d;
+  }
+  return sqrt(vec2(d1, d2));
+}
+// The wordmark on the surface or the bottom of the cup, across a circle of
+// radius R. 1 inside the letters, 0 outside, with a soft edge.
+float logoMask(vec2 q, float R, float soft) {
+  float k = 1215.0 / (2.0 * R * .8);
+  return smoothstep(soft, -soft, sdLogo2D(q * k + vec2(607.5, 142.5)));
+}
+// The opaque surface of the tea: matcha foam or chai.
+Mat surfaceMat(vec3 pos, vec3 n, vec3 rd) {
+  vec3 cq = cupFrame(pos);
+  float R = liquidR();
+  vec2 q = cq.xz;
+  float rn = length(q) / R;
+  if (n.y < .7) {
+    // The side of the tea, where the march meets it through a gap
+    return Mat(cFoam * .6, .4, .03, 0.0, .5, n);
+  }
+  vec3 albedo; float rough; vec3 nn = n;
+  if (uTopKind < .5) {
+    // Matcha: fine foam over the whole bowl, with a few larger bubbles. The
+    // whisk leaves soft streaks.
+    vec2 c1 = cells(q * 60.0);
+    float wall1 = 1.0 - smoothstep(.0, .12, c1.y - c1.x);
+    vec3 small = bubbleField(q * 26.0, .5, .32), big = bubbleField(q * 9.0 + 7.0, .14, .3);
+    float streak = fbmr(vec2(q.x * 1.2 + sin(q.y * 2.5) * .8, q.y * 3.5));
+    albedo = cFoam * (.9 + .16 * streak) * (1.0 - .12 * wall1);
+    // A bubble has a darker rim and a lighter skin.
+    float rimS = small.z * smoothstep(.6, 1.0, length(small.xy)), rimB = big.z * smoothstep(.7, 1.0, length(big.xy));
+    albedo *= (1.0 - .2 * rimS) * (1.0 - .35 * rimB) * (1.0 + .06 * big.z);
+    if (uTopScene > .5) {
+      // The wordmark is a lighter, finer foam with soft, uneven edges.
+      float m = logoMask(q + (vec2(noise2(q * 14.0), noise2(q * 14.0 + 6.0)) - .5) * .025, R, 5.0);
+      albedo = mix(albedo, mix(cFoam, vec3(.85, .9, .6), .45) * (.97 + .05 * noise2(q * 90.0)), m);
+    }
+    rough = .55;
+    nn = normalize(n + vec3(small.x, 0.0, small.y) * .25 + vec3(big.x, 0.0, big.y) * .5 + (vec3(noise2(q * 40.0), 0.0, noise2(q * 40.0 + 3.0)) - .5) * .06);
+  } else {
+    // Chai: milky tea with a thin skin, specks of spice and small bubbles at the wall
+    float skin = fbmr(q * 1.6);
+    albedo = cFoam * (.92 + .14 * skin);
+    vec3 sp = nearest(q * 30.0);
+    float speck = step(.93, sp.z) * smoothstep(.16, .06, length(sp.xy)) * (.6 + .4 * fract(sp.z * 9.1));
+    albedo = mix(albedo, srgb(vec3(.32, .16, .07)), speck * .7);
+    vec2 c = cells(q * 18.0);
+    float ring = smoothstep(.8, .97, rn) * (1.0 - smoothstep(.0, .12, c.y - c.x));
+    albedo = mix(albedo, albedo * 1.12, ring * .5);
+    if (uTopScene > .5) {
+      // The wordmark is cinnamon, dusted through a stencil.
+      float m = logoMask(q + (vec2(noise2(q * 30.0), noise2(q * 30.0 + 4.0)) - .5) * .03, R, 3.0);
+      float dust = step(.4, hash12(floor(q * 160.0)));
+      albedo = mix(albedo, srgb(vec3(.5, .24, .1)) * (.8 + .4 * hash12(floor(q * 160.0) + 3.0)), m * mix(.75, 1.0, dust));
+    }
+    rough = .28;
+    nn = normalize(n + vec3(fbmr(q * 2.3) - .5, 0.0, fbmr(q * 2.3 + 5.0) - .5) * .12);
+  }
+  albedo *= mix(1.0, .7, smoothstep(.85, 1.0, rn));
+  return Mat(albedo, rough, .03, 0.0, .3, nn);
+}
+// Clear tea: the surface reflects the room, and the cup shows through the
+// tea, darker and warmer with depth.
+vec3 clearTea(vec3 pl, vec3 rd) {
+  vec3 cq = cupFrame(pl);
+  vec2 w = vec2(fbm2(pl.xz * 1.1 + 4.0), fbm2(pl.xz * 1.1 + 9.0)) - .5;
+  vec3 n = normalize(vec3(w.x * .025, 1.0, w.y * .025));
+  float nv = max(dot(n, -rd), 0.0);
+  float fr = schlick(nv, .02);
+  vec3 key = normalize(uKeyDir);
+  vec3 refl = env(reflect(rd, n));
+  vec3 spec = uKeyCol * ggx(n, normalize(key - rd), .035) * .8;
+  vec3 rdr = refract(rd, n, 1.0 / 1.333);
+  float t = 0.0;
+  for (int i = ZERO; i < 60; i++) {
+    float d = -sdInner(cq + rdr * t);
+    if (d < .002) break;
+    t += max(d * .9, .003);
+  }
+  vec3 bq = cq + rdr * t, bp = pl + rdr * t;
+  vec3 nb = -innerNormal(bq);
+  vec3 dn = nb;
+  float rough, f0, metal;
+  vec3 albedo = vesselAlbedo(bp, false, dn, rough, f0, metal);
+  if (uTopScene > .5 && nb.y > .8) {
+    // The wordmark, painted in cobalt under the glaze at the bottom
+    // The mark runs a little past the flat bottom, so it reads from above.
+    float m = logoMask(bq.xz, (uCup.x - uCup.w) * 1.35, 1.2);
+    albedo = mix(albedo, srgb(vec3(.12, .2, .55)), m * .9);
+  }
+  vec3 lit = light(bp + nb * .01, nb, rdr, albedo, .2, .04, 0.0, 0.0);
+  // A white cup bounces light around inside, so its shaded side still glows.
+  lit += albedo * uKeyCol * .16;
+  float depth = max(liquidTop() - bq.y, 0.0);
+  // cLiquor is the color of the tea over white porcelain, along a path of
+  // about 6 units: down to the bottom and up again.
+  vec3 sigma = -log(max(cLiquor, vec3(.002))) / 6.0;
+  vec3 inside = lit * exp(-sigma * (t + depth / max(key.y, .5)));
+  // Light that scatters in the tea gives it some body.
+  inside += cLiquor * uKeyCol * .03;
+  return mix(inside, refl, fr) + spec;
+}
+Mat opaqueMat(vec3 pos, vec3 n, vec3 rd, float id) {
+  if (id < 1.5) return tableMat(pos, n);
+  if (id < 2.2) return vesselMat(pos, n, false);
+  if (id < 2.7) return vesselMat(pos, n, true);
+  if (id < 3.5) return surfaceMat(pos, n, rd);
+  if (id < 4.5) { map(pos); return shapeMat(pos, n, rd); }
+  return Mat(vec3(.9, .9, .92), .09, .9, 1.0, 0.0, n);
+}
+vec3 render(vec3 ro, vec3 rd) {
+  vec2 h = march(ro, rd, 120.0);
+  vec3 col = env(rd);
+  if (h.y > 0.0) { vec3 pos = ro + rd * h.x; col = shade(pos, rd, opaqueMat(pos, calcNormal(pos, h.x), rd, h.y)); }
+  if (abs(uTopKind - 1.0) < .5 && rd.y < 0.0) {
+    float ly = uCupPos.y + baseY() + uCupMore.w + liquidTop();
+    float tl = (ly - ro.y) / rd.y;
+    if (tl > 0.0 && (h.y < 0.0 || tl < h.x)) {
+      vec3 pl = ro + rd * tl;
+      if (sdInner(cupFrame(pl)) < -.005) col = clearTea(pl, rd);
+    }
+  }
+  return col;
+}
+${MAIN}`;
+
+// A close-up of the surface of the tea, where milk swirls in or the foam
+// settles. The surface is flat, so a ray hits it in one step, and the height
+// only bends the normal.
+SCENES.swirl = `
+float swirl(vec2 p, out float ribbon) {
+  // Each tea gets its own pour: the noise moves, and the swirl turns more
+  // or less, in either direction. Night and day share the pour.
+  vec2 o = hash22(vec2(uIndex * 1.7, 4.1)) * 60.0;
+  float turn = (1.9 + hash12(vec2(uIndex, 9.3))) * (hash12(vec2(uIndex, 2.7)) < .5 ? -1.0 : 1.0);
+  vec2 c = vec2(1.5, -2.0);
+  vec2 d = p - c; float r = length(d);
+  float a = turn * exp(-r / 5.0);
+  vec2 b = (c + rot(a) * d) * .18 + o;
+  vec2 q = vec2(fbm2(b), fbm2(b + vec2(5.2, 1.3)));
+  vec2 s = vec2(fbm2(b + 3.2 * q + vec2(1.7, 9.2)), fbm2(b + 3.2 * q + vec2(8.3, 2.8)));
+  ribbon = exp(-abs(s.x - .55) * 40.0);
+  return fbm2(b + 3.2 * s);
+}
+// Bubbles: a cell pattern. uFoamy sets how many there are.
+float bubbles(vec2 p, float scale, float density) {
+  vec2 g = p * scale; vec2 c = floor(g); vec2 f = fract(g) - hash22(c);
+  float rad = .06 + .14 * hash12(c + 3.0);
+  return smoothstep(rad, rad * .35, length(f)) * step(1.0 - density, hash12(c));
+}
+float heightAt(vec2 p) {
+  float rib; float v = swirl(p, rib);
+  float bub = bubbles(p, 9.0, .12) * smoothstep(.3, .9, rib + smoothstep(.55, .62, v) * (1.0 - smoothstep(.62, .7, v)));
+  bub += uFoamy * (bubbles(p, 26.0, .55) * .5 + bubbles(p, 60.0, .7) * .25);
+  return v * .12 + rib * .04 + bub * .03;
+}
+vec3 render(vec3 ro, vec3 rd) {
+  if (rd.y > -.001) return env(rd);
+  float t = -ro.y / rd.y;
+  vec3 pos = ro + rd * t;
+  float rib; float v = swirl(pos.xz, rib);
+  // At night more of the frame is dark tea, so the photo stays dark.
+  float lo = uDay > .5 ? .5 : .57;
+  float t1 = smoothstep(lo, lo + .24, v);
+  vec3 albedo = mix(cSwA, cSwB, smoothstep(.0, .55, t1));
+  albedo = mix(albedo, cSwC, smoothstep(.55, 1.0, t1));
+  albedo = mix(albedo, cSwC, rib * .6);
+  albedo *= .92 + .16 * noise2(pos.xz * 30.0);
+  // Foam darkens a little in the gaps between bubbles.
+  albedo *= 1.0 - uFoamy * .25 * bubbles(pos.xz, 26.0, .55);
+  float e = .02;
+  float h0 = heightAt(pos.xz), hx = heightAt(pos.xz + vec2(e, 0.0)) - h0, hz = heightAt(pos.xz + vec2(0.0, e)) - h0;
+  vec3 n = normalize(vec3(-hx / e * .5, 1.0, -hz / e * .5));
+  vec3 key = normalize(uKeyDir), v2 = -rd, hh = normalize(key + v2);
+  float nl = max(dot(n, key), 0.0);
+  vec3 col = albedo * (uKeyCol * nl * .7 + uFillCol * .9);
+  float fr = schlick(max(dot(n, v2), 0.0), .025);
+  col += env(reflect(rd, n)) * fr * 1.3 * (1.0 - uFoamy * .9);
+  col += uKeyCol * ggx(n, hh, mix(.06, .3, t1) + uFoamy * .45) * schlick(max(dot(hh, v2), 0.0), .025) * nl * (1.0 - uFoamy * .7);
+  return col;
+}
+${MAIN}`;
+
+// ---------- the renderer ----------
+
+const LEAF_KIND = { powder: 0, twisted: 1, spices: 2, pearls: 3 };
+// The top and float scenes are the cup scene with other cameras.
+const BASE_SCENE = { top: 'cup', float: 'cup' };
+
+function program(scene, leaf) {
+  const name = BASE_SCENE[scene] || scene;
+  const key = `${name}:${leaf}`;
+  if (programs[key]) return programs[key];
+  const compile = (type, src) => {
+    const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(`${key}: ${gl.getShaderInfoLog(s)}`);
+    return s;
+  };
+  const head = COMMON.replace('#version 300 es', `#version 300 es\n#define LEAF ${leaf}`);
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, head + TABLE + SHAPES + SCENES[name]));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(`${key}: ${gl.getProgramInfoLog(prog)}`);
+  const post = gl.createProgram();
+  gl.attachShader(post, compile(gl.VERTEX_SHADER, VERT));
+  gl.attachShader(post, compile(gl.FRAGMENT_SHADER, POST));
+  gl.linkProgram(post);
+  if (!gl.getProgramParameter(post, gl.LINK_STATUS)) throw new Error(`post: ${gl.getProgramInfoLog(post)}`);
+  return (programs[key] = { prog, post });
+}
+
+// Tone curve, color grade, vignette and grain.
+const POST = `#version 300 es
+precision highp float;
+uniform sampler2D uAccum;
+uniform float uSamples, uDay, uSeed;
+uniform vec2 uRes;
+uniform vec3 cShadow, cHigh;
+out vec4 outColor;
+vec3 aces(vec3 x) { return clamp((x * (2.51 * x + .03)) / (x * (2.43 * x + .59) + .14), 0.0, 1.0); }
+float hash12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * .1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec3 c = texture(uAccum, uv).rgb / uSamples;
+  c = aces(c * (uDay > .5 ? 1.0 : 1.12));
+  c = pow(c, vec3(1.0 / 2.2));
+  float l = dot(c, vec3(.2126, .7152, .0722));
+  c = mix(vec3(l), c, .9);
+  c = mix(c, c * cShadow * 2.0, (1.0 - smoothstep(0.0, .45, l)) * .22);
+  c = mix(c, c * cHigh * 1.6, smoothstep(.55, 1.0, l) * .12);
+  vec2 q = uv - .5;
+  c *= 1.0 - (uDay > .5 ? .22 : .42) * pow(length(q * vec2(1.0, .8)) * 1.35, 2.4);
+  c += (hash12(gl_FragCoord.xy + uSeed) - .5) * (uDay > .5 ? .01 : .014);
+  outColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+}`;
+
+function texture(w, h, internal, format, type) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  return t;
+}
+
+// Halton numbers spread the samples evenly over the pixel and the lens.
+function halton(i, b) { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; }
+
+window.renderPhoto = async (opts) => {
+  const { width, height, samples } = opts;
+  const P = params(opts);
+  const { prog, post } = program(P.scene, P.leaf);
+  canvas.width = 16; canvas.height = 16;
+  const accum = texture(width, height, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, accum, 0);
+  gl.viewport(0, 0, width, height);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+
+  gl.useProgram(prog);
+  const u = n => gl.getUniformLocation(prog, n);
+  const set3 = (n, v) => gl.uniform3fv(u(n), v);
+  gl.uniform2f(u('uRes'), width, height);
+  set3('uCamPos', P.cam.pos); set3('uCamTarget', P.cam.target);
+  gl.uniform1f(u('uFocal'), P.cam.focal); gl.uniform1f(u('uAperture'), P.cam.aperture); gl.uniform1f(u('uFocus'), P.cam.focus);
+  set3('uKeyDir', P.keyDir); set3('uKeyCol', P.keyCol); set3('uFillCol', P.fillCol); set3('uRimDir', P.rimDir); set3('uRimCol', P.rimCol);
+  gl.uniform1f(u('uDay'), P.day); gl.uniform1f(u('uSoft'), P.soft);
+  for (const [k, v] of Object.entries(P.colors)) set3(k, v);
+  gl.uniform3fv(u('cBokeh'), P.bokeh.flat());
+  gl.uniform1f(u('uTable'), P.table); gl.uniform1f(u('uIndex'), P.index);
+  gl.uniform1f(u('uTopKind'), P.topKind); gl.uniform1f(u('uTopScene'), P.topScene); gl.uniform1f(u('uFoamy'), P.foamy || 0);
+  gl.uniform4fv(u('uProps'), new Float32Array(80).map((_, i) => (P.props[Math.floor(i / 4)] || [0, 0, 0, 0])[i % 4]));
+  gl.uniform1i(u('uPropCount'), P.props.length);
+  gl.uniform1i(u('uZero'), 0);
+  if (P.cup) {
+    set3('uCupPos', P.cup.pos);
+    gl.uniform4fv(u('uCup'), P.cup.dims); gl.uniform4fv(u('uCupFlags'), P.cup.flags); gl.uniform4fv(u('uCupMore'), P.cup.more);
+    gl.uniform1f(u('uBulge'), P.cup.bulge); gl.uniform1f(u('uFootR'), P.cup.footR);
+  }
+  gl.uniform4fv(u('uSpoon'), P.spoon || [0, 0, 0, 0]);
+  gl.uniform1f(u('uLogoK'), P.logoK || 21);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, logoTexture); gl.uniform1i(u('uLogo'), 1);
+  gl.activeTexture(gl.TEXTURE0);
+  if (logoInfo) gl.uniform4f(u('uLogoInfo'), logoInfo.w, logoInfo.h, logoInfo.scale, logoInfo.pad);
+
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.enable(gl.SCISSOR_TEST);
+  // Small tiles keep each draw call short. A long draw blocks the desktop
+  // compositor, and the kernel driver then resets the GPU.
+  const TILE = opts.tile || 128;
+  const probe = new Float32Array(4);
+  for (let s = 0; s < samples; s++) {
+    const jx = halton(s + 1, 2) - .5, jy = halton(s + 1, 3) - .5;
+    const a = halton(s + 1, 5) * Math.PI * 2, r = Math.sqrt(halton(s + 1, 7));
+    gl.uniform2f(u('uJitter'), jx, jy);
+    gl.uniform2f(u('uLens'), Math.cos(a) * r, Math.sin(a) * r);
+    gl.uniform1f(u('uSeed'), s * 17.31);
+    let batch = 0;
+    for (let y = 0; y < height; y += TILE) for (let x = 0; x < width; x += TILE) {
+      gl.scissor(x, y, Math.min(TILE, width - x), Math.min(TILE, height - y));
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      // Reading 1 pixel waits for the GPU, so the driver gets many short jobs.
+      // gl.finish() alone lets the draws pile up into one job, and the kernel
+      // resets the GPU when a job runs longer than 5 seconds.
+      if (++batch % 8 === 0) gl.readPixels(x, y, 1, 1, gl.RGBA, gl.FLOAT, probe);
+    }
+    if (gl.isContextLost()) throw new Error(`The GPU context was lost at sample ${s + 1}`);
+    // Let the page breathe between samples.
+    await new Promise(res => setTimeout(res, 0));
+  }
+  gl.disable(gl.BLEND); gl.disable(gl.SCISSOR_TEST);
+
+  // Post pass into an 8-bit target, then read back in strips.
+  const out = texture(width, height, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
+  const fbo2 = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo2);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, out, 0);
+  gl.useProgram(post);
+  const pu = n => gl.getUniformLocation(post, n);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, accum); gl.uniform1i(pu('uAccum'), 0);
+  gl.uniform1f(pu('uSamples'), samples); gl.uniform1f(pu('uDay'), P.day); gl.uniform1f(pu('uSeed'), P.index * 3.7);
+  gl.uniform2f(pu('uRes'), width, height);
+  gl.uniform3fv(pu('cShadow'), P.grade.shadow); gl.uniform3fv(pu('cHigh'), P.grade.high);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  const c2 = document.createElement('canvas'); c2.width = width; c2.height = height;
+  const ctx = c2.getContext('2d');
+  const STRIP = 256, buf = new Uint8Array(width * STRIP * 4);
+  for (let y = 0; y < height; y += STRIP) {
+    const h = Math.min(STRIP, height - y);
+    gl.readPixels(0, y, width, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    const img = ctx.createImageData(width, h);
+    for (let row = 0; row < h; row++) img.data.set(buf.subarray(row * width * 4, (row + 1) * width * 4), (h - 1 - row) * width * 4);
+    ctx.putImageData(img, 0, height - y - h);
+  }
+  [accum, out].forEach(t => gl.deleteTexture(t));
+  gl.deleteFramebuffer(fbo); gl.deleteFramebuffer(fbo2);
+  return c2.toDataURL('image/jpeg', opts.quality || .9);
+};
+
+// ---------- scene parameters ----------
+
+// Cups and bowls: bottom and top radius, height and wall, a handle, a foot
+// ring as [radius, height], a saucer radius, a gold rim, the level of the
+// tea, the bulge of the profile and the material.
+const VESSELS = {
+  chawan: { rb: 2.6, rt: 4.4, h: 4.6, wall: .3, level: .48, bulge: .5, foot: [1.7, .45], mat: 4 },
+  teacup: { rb: 1.6, rt: 3.5, h: 3.3, wall: .13, handle: 1, saucer: 5.9, gold: 1, level: .8, bulge: .3, mat: 5 },
+  kulhad: { rb: 1.8, rt: 2.6, h: 5.0, wall: .26, level: .86, bulge: .22, mat: 2 },
+  cup: { rb: 1.3, rt: 2.7, h: 2.8, wall: .12, level: .78, bulge: .14, foot: [1.05, .22], mat: 5 },
+};
+const TOP_KIND = { foam: 0, clear: 1, milky: 2 };
+
+function cupParams(vesselName, pos, r) {
+  const v = VESSELS[vesselName] || VESSELS.cup;
+  return {
+    v, pos,
+    dims: [v.rb, v.rt, v.h, v.wall],
+    flags: [v.handle ? 1 : 0, v.saucer ? 1 : 0, v.gold ? 1 : 0, v.level],
+    more: [v.saucer || 0, -.55 + (r() - .5) * .5, v.mat || 0, v.foot ? v.foot[1] : 0],
+    bulge: v.bulge, footR: v.foot ? v.foot[0] : 0,
+  };
+}
+// Height of the tea surface above the base of the cup, and its radius.
+function liquid(v) {
+  const top = v.wall + (v.h - v.wall) * v.level;
+  const r = v.rb - v.wall + (v.rt - v.rb) * (top - v.wall) / v.h + v.bulge * Math.sin(Math.PI * Math.min(top / v.h, 1));
+  return { y: (v.saucer ? .18 : 0) + (v.foot ? v.foot[1] : 0) + top, r };
+}
+
+// The props of each kind of tea, as lists of kinds. scatter() places them.
+const PROPS = {
+  twisted: [12, 1, 1, 1, 1, 1, 1, 2, 2, 2],
+  spices: [5, 4, 4, 3, 3, 3, 3, 6, 6, 6, 7, 7],
+  pearls: [9, 9, 9, 8, 8, 8, 8, 8, 8, 8],
+  powder: [11],
+};
+// Props on the table, away from a circle around the cup. Big props get more room.
+function scatter(r, kinds, cx, cz, keep, area) {
+  const list = [];
+  for (const k of kinds) {
+    const room = k === 5 || k === 11 ? 4.2 : k === 12 || k === 9 || k === 4 ? 2.3 : 1.3;
+    for (let i = 0; i < 300; i++) {
+      const x = cx + (r() - .5) * area[0], z = cz + (r() - .5) * area[1];
+      if (Math.hypot(x - cx, z - cz) < keep + room * .5) continue;
+      if (list.some(b => Math.hypot(b[0] - x, b[1] - z) < (b.room + room) * .55)) continue;
+      const b = [x, z, r() * 6.283, k]; b.room = room;
+      list.push(b);
+      break;
+    }
+  }
+  return list.map(b => [b[0], b[1], b[2], b[3]]);
+}
+
+function params(opts) {
+  const t = opts.theme, c = t.colors, day = c.mode === 'light';
+  // Jasmine shows blossoms on the tea instead of a swirl.
+  const scene = opts.scene === 'swirl' && t.swirl === 'blossoms' ? 'float' : opts.scene;
+  const r = rng(t.index * 7919 + (day ? 3 : 0) + scene.length * 101);
+  const accent = lin(c.accent), second = lin(t.second);
+  const table = t.table[day ? 1 : 0];
+  let tableA, tableB;
+  if (table === 0) { tableA = mix(c.darker_background, '#1d120b', .6); tableB = mix(c.background, '#5c3b22', .5); }
+  else if (table === 1) { tableA = mix(c.darker_background, '#1c1e20', .55); tableB = mix(c.background, '#34363a', .55); }
+  else if (table === 2) { tableA = mix(c.background, '#ffffff', .65); tableB = mix(mix(c.muted, '#8a8580', .5), c.accent, .1); }
+  else if (table === 3) { tableA = mix(c.background, '#ffffff', .3); tableB = mix(c.background, c.muted, .3); }
+  else if (table === 4) { tableA = day ? mix(c.background, '#a27a48', .4) : mix(c.darker_background, '#6a4a2a', .55); tableB = day ? mix(c.background, '#ffffff', .45) : mix(c.background, '#9a7448', .45); }
+  else { tableA = mix(c.darker_background, '#240c08', .6); tableB = mix(c.background, '#5e2518', .5); }
+  const vessel = VESSELS[t.vessel];
+  const glaze = t.vessel === 'cup' ? (day ? '#f4f7f8' : '#dfe6ea') : t.vessel === 'teacup' ? (day ? '#f8f6f2' : '#e9e5df') : mix(c.background, '#ffffff', .5);
+  const liquor = t.liquor;
+  const foam = t.top === 'foam' ? mix(liquor, '#d6e39a', .3) : liquor;
+  const swirl = {
+    foam: [mix(liquor, '#28400c', .35), liquor, mix(liquor, '#e3ecb4', .5)],
+    milk: t.top === 'milky' ? [mix(liquor, '#3a1c0c', .55), liquor, '#f3e6d0'] : [mix(liquor, '#2a1006', .45), mix(liquor, '#e8d6c0', .45), '#f4ede2'],
+  }[t.swirl] || [liquor, liquor, liquor];
+  const warm = [1.0, .84, .66], daylight = [1.0, .98, .95];
+  const P = {
+    scene, leaf: LEAF_KIND[t.leaf] ?? 1,
+    day: day ? 1 : 0, index: t.index, table,
+    soft: day ? 6 : 12,
+    keyDir: day ? [-.6, .85, .5] : [-.85, .5, -.3],
+    keyCol: day ? daylight.map(v => v * 2.3) : warm.map(v => v * 2.6),
+    fillCol: day ? [.36, .37, .40] : lin(c.background).map(v => v * 1.2 + .01),
+    rimDir: day ? [.6, .4, -.7] : [.75, .45, -.55],
+    rimCol: day ? [.12, .12, .12] : accent.map(v => v * .6),
+    colors: {
+      cBg: lin(c.background), cDark: lin(c.darker_background), cFg: lin(c.foreground), cAccent: accent, cSecond: second,
+      cGlaze: lin(glaze), cTableA: lin(tableA), cTableB: lin(tableB), cLeaf: lin(mix('#160e09', c.accent, .03)),
+      cLiquor: lin(liquor), cFoam: lin(foam), cPowder: lin(mix(liquor, '#86b54a', .35)),
+      cSwA: lin(swirl[0]), cSwB: lin(swirl[1]), cSwC: lin(swirl[2]),
+    },
+    bokeh: [c.accent, t.second, '#ffd8a0', '#ffe9c9', t.ansi[3], t.ansi[11]].map(h => lin(h || '#ffd8a0')),
+    grade: { shadow: lin(mix(c.darker_background, '#808080', .5)), high: lin(mix(c.accent, '#ffffff', .7)) },
+    props: [], topKind: TOP_KIND[t.top] ?? 1, topScene: scene === 'top' ? 1 : 0,
+    cam: { pos: [0, 2.4, 9.5], target: [0, .2, 0], focal: 2.2, aperture: .14, focus: 9.3 },
+  };
+  const look = (pos, target, focal, aperture) => ({ pos, target, focal, aperture, focus: Math.hypot(...pos.map((v, i) => v - target[i])) });
+
+  if (scene === 'leaves') {
+    if (t.leaf === 'powder') {
+      P.cam = look([-.6, 2.0, 9.8], [.6, .9, -1.4], 2.6, .2);
+      // The scoop lies on the table with its tip in the powder.
+      P.props = [[-4.6, 1.6, -.535, 11]];
+    } else if (t.leaf === 'twisted') {
+      P.cam = look([0, 1.7 + r() * .3, 5.4], [(r() - .5) * 1.0, .1, 0], 2.4, .12);
+    } else if (t.leaf === 'pearls') {
+      P.cam = look([0, 2.0 + r() * .3, 6.4], [(r() - .5) * 1.0, .1, 0], 2.4, .13);
+    } else {
+      P.cam = look([0, 2.4 + r() * .3, 7.2], [(r() - .5) * 1.2, .1, 0], 2.4, .14);
+    }
+    if (day) { P.keyDir = [-.5, 1.0, .35]; }
+  } else if (scene === 'cup' || scene === 'top' || scene === 'float') {
+    const top = scene === 'top';
+    const cup = cupParams(t.vessel, [0, 0, 0], r);
+    P.cup = cup;
+    const v = cup.v, L = liquid(v);
+    const R = v.saucer || v.rt + 1;
+    const kinds = PROPS[t.leaf] || [];
+    if (top) {
+      // The steam video expects the tea at the middle of the frame, 20 px
+      // low at 3840 x 2160, with a radius of 702 px.
+      const focal = 3.0, height = L.r * focal / (702 / 1080);
+      P.cam = { pos: [0, L.y + height, .001], target: [0, 0, -20 / 1080 * height / focal], focal, aperture: 0, focus: height };
+      P.cam.pos[2] = P.cam.target[2] + .001;
+      if (v.saucer) P.spoon = [R + 2.6, 2.4, -1.95, 1];
+      if (!day) P.keyDir = [-.6, .75, -.3];
+      P.props = scatter(r, kinds, 0, 0, R + .6, [44, 26]);
+      if (t.leaf === 'pearls') P.props.push([L.r * .35, -L.r * .42, 1.3, -9]);
+    } else if (scene === 'float') {
+      // Close to the tea, from the side of the lamp, with 3 blossoms afloat
+      P.cam = look([-2.2, L.y + 4.2, 4.6], [.3, L.y, -.2], 2.6, .1);
+      P.props = [[-.7, .5, .3, -9], [1.0, -.4, 2.1, -9], [.3, 1.5, 4.0, -9]];
+    } else {
+      const span = Math.max(v.h, R * .9);
+      const dist = 7.5 + span * 1.25;
+      P.cam = look([-1.4, L.y * .6 + dist * .78, dist * .72], [-3.2, L.y * .55, .6], 2.5, day ? .22 : .26);
+      if (v.saucer) { const a = .35 + r() * .3; P.spoon = [Math.cos(a) * R * .6, Math.sin(a) * R * .6 + .3, -a, 1]; }
+      P.props = scatter(r, kinds, 0, 0, R + .5, [34, 20]);
+      if (t.leaf === 'pearls') P.props.push([L.r * .3, L.r * .2, .8, -9]);
+    }
+    P.props = P.props.slice(0, 20);
+    if (day) P.keyDir = [-.65, .9, .35];
+  } else if (scene === 'swirl') {
+    P.foamy = t.swirl === 'foam' ? 1 : 0;
+    P.cam = look([0, 3.8, 5.0], [0, 0, -1.2], 2.5, .1);
+    P.keyCol = P.keyCol.map(v => v * .85);
+    P.keyDir = day ? [-.35, .8, -.5] : [-.25, .55, -.8];
+  } else if (scene === 'wordmark') {
+    P.logoK = 1215 / 58;
+    P.cam = look([0, 30, 23], [0, 0, 1.2], 2.15, .3);
+    P.keyDir = day ? [-.55, .85, .45] : [-.8, .55, -.25];
+    if (t.leaf === 'powder') P.props = [[21, 9.5, 2.6, 11]];
+  }
+  return P;
+}
+</script>
+</body>
+</html>

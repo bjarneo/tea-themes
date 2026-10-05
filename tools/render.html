@@ -1,0 +1,386 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Tea background renderer</title>
+<style>html,body{margin:0;background:#000}canvas{display:block}</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// The brew guide background. tools/render.mjs loads this page in headless
+// Chromium and calls window.renderImage() for each image. All drawing uses a
+// 3840x2160 design space. S scales the design space to the output size, and
+// blur radii scale with S, so every size looks the same.
+//
+// The guide shows the water temperature, the brew time, the weight of the
+// tea, the water and the brew steps. tools/photo.html renders the other
+// backgrounds as photographs.
+
+const W = 3840, H = 2160;
+const MONO = '"JetBrainsMono Nerd Font", "JetBrains Mono", monospace';
+const SERIF = '"Noto Serif", serif';
+let LOGO = [];
+let S = 1;
+
+window.setLogo = paths => { LOGO = paths.map(p => ({ path: new Path2D(p.d), rule: p.evenodd ? 'evenodd' : 'nonzero' })); };
+
+// ---------- helpers ----------
+
+function rng(seed) {
+  return () => {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function rgb(hex) { return [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16)); }
+function rgba(hex, a) { const [r, g, b] = rgb(hex); return `rgba(${r},${g},${b},${a})`; }
+function mix(a, b, t) {
+  const pa = rgb(a), pb = rgb(b);
+  return '#' + pa.map((v, i) => Math.round(v * (1 - t) + pb[i] * t).toString(16).padStart(2, '0')).join('');
+}
+function lum(hex) { const [r, g, b] = rgb(hex); return (.2126 * r + .7152 * g + .0722 * b) / 255; }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function smooth(t) { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); }
+
+// Canvas blur ignores the transform, so the radius scales with S.
+const blur = r => `blur(${(r * S).toFixed(1)}px)`;
+
+// Seeded 2D gradient noise.
+function makeNoise(seed) {
+  const r = rng(seed), perm = new Uint8Array(512), grad = [];
+  const p = [...Array(256).keys()];
+  for (let i = 255; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [p[i], p[j]] = [p[j], p[i]]; }
+  for (let i = 0; i < 512; i++) perm[i] = p[i & 255];
+  for (let i = 0; i < 256; i++) { const a = r() * Math.PI * 2; grad.push([Math.cos(a), Math.sin(a)]); }
+  const fade = t => t * t * t * (t * (t * 6 - 15) + 10);
+  function n(x, y) {
+    const x0 = Math.floor(x), y0 = Math.floor(y), sx = fade(x - x0), sy = fade(y - y0);
+    const X = x0 & 255, Y = y0 & 255, fx = x - x0, fy = y - y0;
+    const d = (dx, dy) => { const g = grad[perm[((X + dx) & 255) + perm[(Y + dy) & 255]]]; return g[0] * (fx - dx) + g[1] * (fy - dy); };
+    return lerp(lerp(d(0, 0), d(1, 0), sx), lerp(d(0, 1), d(1, 1), sx), sy);
+  }
+  n.fbm = (x, y, oct = 5) => { let s = 0, a = .5, f = 1; for (let i = 0; i < oct; i++) { s += a * n(x * f, y * f); a *= .5; f *= 2; } return s; };
+  return n;
+}
+
+// Fills the design space from a per-pixel function at a lower resolution.
+// fn(x, y) gets design coordinates and returns [r, g, b].
+function pixels(ctx, fn, width = 1600) {
+  const tw = Math.min(width, Math.round(W * S)), th = Math.round(tw * H / W);
+  const cv = document.createElement('canvas'); cv.width = tw; cv.height = th;
+  const cx = cv.getContext('2d'), img = cx.createImageData(tw, th), d = img.data;
+  for (let j = 0, i = 0; j < th; j++) {
+    const y = (j + .5) * H / th;
+    for (let k = 0; k < tw; k++, i += 4) {
+      const c = fn((k + .5) * W / tw, y);
+      d[i] = c[0]; d[i + 1] = c[1]; d[i + 2] = c[2]; d[i + 3] = 255;
+    }
+  }
+  cx.putImageData(img, 0, 0);
+  ctx.save(); ctx.imageSmoothingQuality = 'high'; ctx.drawImage(cv, 0, 0, W, H); ctx.restore();
+}
+
+// Interpolates a list of hex colors at t from 0 to 1, as [r, g, b].
+function ramp(stops, t) {
+  t = clamp(t, 0, 1) * (stops.length - 1);
+  const i = Math.min(stops.length - 2, Math.floor(t)), f = t - i;
+  const a = stops[i], b = stops[i + 1];
+  return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
+}
+
+function vignette(ctx, P, amount) {
+  const g = ctx.createRadialGradient(W / 2, H / 2, H * .35, W / 2, H / 2, W * .62);
+  const c = P.light ? P.c[8] : P.darker;
+  g.addColorStop(0, rgba(c, 0)); g.addColorStop(1, rgba(c, amount ?? (P.light ? .22 : .55)));
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+
+// Fine grain hides gradient banding after JPEG compression.
+function grain(ctx, seed, alpha = .05) {
+  const cv = document.createElement('canvas'); cv.width = cv.height = 256;
+  const gx = cv.getContext('2d'), r = rng(seed), img = gx.createImageData(256, 256);
+  for (let i = 0; i < img.data.length; i += 4) { const v = r() * 255; img.data[i] = img.data[i + 1] = img.data[i + 2] = v; img.data[i + 3] = 255; }
+  gx.putImageData(img, 0, 0);
+  ctx.save();
+  ctx.globalAlpha = alpha; ctx.globalCompositeOperation = 'overlay';
+  const pattern = ctx.createPattern(cv, 'repeat');
+  pattern.setTransform(new DOMMatrix().scale(1 / S));
+  ctx.fillStyle = pattern; ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+}
+
+// Draws a shape with a soft shadow below and to the right, as if the light
+// comes from the top left.
+// A soft ellipse that fades out at the edge. It replaces a blur filter, which
+// is slow on a 6K canvas when it runs hundreds of times.
+function softEllipse(ctx, x, y, rx, ry, rot, color, alpha) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot); ctx.scale(rx, ry);
+  const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 1);
+  g.addColorStop(0, rgba(color, alpha)); g.addColorStop(.55, rgba(color, alpha * .75)); g.addColorStop(1, rgba(color, 0));
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, 1, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+function circle(ctx, x, y, r) { ctx.beginPath(); ctx.arc(x, y, Math.max(0, r), 0, Math.PI * 2); }
+
+function text(ctx, str, x, y, size, color, { font = MONO, weight = '', align = 'left', spacing = 0, alpha = 1, baseline = 'alphabetic', italic = false } = {}) {
+  ctx.save();
+  ctx.font = `${italic ? 'italic ' : ''}${weight} ${size}px ${font}`;
+  ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = baseline; ctx.globalAlpha = alpha;
+  if (spacing) ctx.letterSpacing = `${spacing}px`;
+  ctx.fillText(str, x, y);
+  const w = ctx.measureText(str).width;
+  ctx.restore();
+  return w;
+}
+
+// ---------- the brew guide ----------
+
+// Draws the left text column: the category, the name and the description.
+function titleBlock(ctx, P, x, y) {
+  const label = `${P.category.toUpperCase()}  ·  ${String(P.index).padStart(2, '0')} / ${String(P.total).padStart(2, '0')}`;
+  text(ctx, label, x, y, 40, P.c[8], { spacing: 8 });
+  // Long names shrink to fit the column
+  let size = 230;
+  ctx.save(); ctx.font = `300 ${size}px ${SERIF}`; const w = ctx.measureText(P.base).width; ctx.restore();
+  if (w > 1500) size = Math.floor(size * 1500 / w);
+  text(ctx, P.base, x - 8, y + 40 + size, size, P.fg, { font: SERIF, weight: '300' });
+  ctx.fillStyle = P.accent; ctx.fillRect(x, y + 120 + size, 140, 8);
+  const lines = wrap(ctx, P.desc, 52, 1420);
+  lines.forEach((l, i) => text(ctx, l, x, y + 260 + size + i * 74, 52, P.dfg));
+  return y + 260 + size + lines.length * 74;
+}
+
+// Splits text into lines that fit the width at the given size.
+function wrap(ctx, str, size, width) {
+  const lines = [];
+  let line = '';
+  ctx.save(); ctx.font = `${size}px ${MONO}`;
+  for (const wd of str.split(' ')) {
+    const t = line ? `${line} ${wd}` : wd;
+    if (ctx.measureText(t).width > width && line) { lines.push(line); line = wd; } else line = t;
+  }
+  ctx.restore();
+  lines.push(line);
+  return lines;
+}
+
+function chip(ctx, P, x, y, label) {
+  ctx.save(); ctx.font = `44px ${MONO}`; const w = ctx.measureText(label).width + 64; ctx.restore();
+  ctx.fillStyle = rgba(P.accent, P.light ? .1 : .12); ctx.beginPath(); ctx.roundRect(x, y, w, 86, 43); ctx.fill();
+  ctx.strokeStyle = rgba(P.accent, .55); ctx.lineWidth = 3; ctx.stroke();
+  text(ctx, label, x + 32, y + 58, 44, P.fg);
+  return w;
+}
+
+function paperBase(ctx, P, noise) {
+  ctx.fillStyle = P.bg; ctx.fillRect(0, 0, W, H);
+  pixels(ctx, (x, y) => {
+    const v = noise.fbm(x * .003, y * .003, 3) * .5 + noise(x * .08, y * .08) * .2;
+    return rgb(P.bg).map(ch => ch * (1 + v * (P.light ? .03 : .08)));
+  }, 1400);
+  // Dot grid
+  ctx.fillStyle = rgba(P.c[8], P.light ? .22 : .18);
+  for (let y = 90; y < H; y += 90) for (let x = 90; x < W; x += 90) ctx.fillRect(x - 3, y - 3, 6, 6);
+}
+
+// A card for one gauge, with a label at the top.
+function card(ctx, P, x, y, w, h, label) {
+  ctx.fillStyle = rgba(P.light ? '#ffffff' : P.fg, P.light ? .45 : .035);
+  ctx.beginPath(); ctx.roundRect(x, y, w, h, 36); ctx.fill();
+  ctx.strokeStyle = rgba(P.c[8], P.light ? .35 : .3); ctx.lineWidth = 3; ctx.stroke();
+  text(ctx, label, x + 56, y + 96, 38, P.c[8], { spacing: 7 });
+}
+
+const minutes = s => s >= 60 ? `${+(s / 60).toFixed(1)}`.replace(/\.0$/, '') : `${s}`;
+function timeText(b) {
+  const [a, z] = b.time, unit = z >= 60 ? 'min' : 's';
+  return a === z ? `${minutes(a)} ${unit}` : `${minutes(a)} to ${minutes(z)} ${unit}`;
+}
+
+// Water temperature: a dial from 50 °C to 100 °C, filled to the target.
+function tempGauge(ctx, P, x, y, w, h) {
+  card(ctx, P, x, y, w, h, 'WATER');
+  const cx = x + w / 2, cy = y + h * .66, R = Math.min(w, h) * .36;
+  const a0 = Math.PI * .8, a1 = Math.PI * 2.2, T = c => a0 + (a1 - a0) * (c - 50) / 50;
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = rgba(P.c[8], .35); ctx.lineWidth = 34;
+  ctx.beginPath(); ctx.arc(cx, cy, R, a0, a1); ctx.stroke();
+  const g = ctx.createLinearGradient(cx - R, 0, cx + R, 0);
+  g.addColorStop(0, P.second); g.addColorStop(1, P.accent);
+  ctx.strokeStyle = g;
+  ctx.beginPath(); ctx.arc(cx, cy, R, a0, T(CURRENT.brew.temp)); ctx.stroke();
+  for (let c = 50; c <= 100; c += 10) {
+    const a = T(c), c1 = Math.cos(a), s1 = Math.sin(a);
+    ctx.strokeStyle = rgba(P.c[8], .8); ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.moveTo(cx + c1 * (R + 30), cy + s1 * (R + 30)); ctx.lineTo(cx + c1 * (R + 52), cy + s1 * (R + 52)); ctx.stroke();
+    text(ctx, `${c}`, cx + c1 * (R + 100), cy + s1 * (R + 100) + 14, 36, P.c[8], { align: 'center' });
+  }
+  const a = T(CURRENT.brew.temp);
+  ctx.fillStyle = P.fg; circle(ctx, cx + Math.cos(a) * R, cy + Math.sin(a) * R, 24); ctx.fill();
+  ctx.fillStyle = P.accent; circle(ctx, cx + Math.cos(a) * R, cy + Math.sin(a) * R, 14); ctx.fill();
+  text(ctx, `${CURRENT.brew.temp}`, cx, cy + 40, 170, P.fg, { font: SERIF, weight: '300', align: 'center' });
+  text(ctx, '°C', cx, cy + 120, 44, P.dfg, { align: 'center', spacing: 4 });
+}
+
+// Time: a ring that marks the range of the brew time on a clock face.
+function timeGauge(ctx, P, x, y, w, h) {
+  const b = CURRENT.brew;
+  card(ctx, P, x, y, w, h, `${b.verb.toUpperCase()} TIME`);
+  const cx = x + w / 2, cy = y + h * .6, R = Math.min(w, h) * .3;
+  // Scale: 1 minute for a whisk, else the next full minute above the max
+  const span = b.time[1] <= 60 ? 60 : Math.ceil(b.time[1] / 60 + 1) * 60;
+  const A = t => -Math.PI / 2 + Math.PI * 2 * t / span;
+  ctx.strokeStyle = rgba(P.c[8], .3); ctx.lineWidth = 30;
+  ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.stroke();
+  ctx.lineCap = 'butt';
+  ctx.strokeStyle = rgba(P.accent, .35);
+  ctx.beginPath(); ctx.arc(cx, cy, R, A(0), A(b.time[0])); ctx.stroke();
+  ctx.strokeStyle = P.accent;
+  ctx.beginPath(); ctx.arc(cx, cy, R, A(b.time[0]), A(b.time[1])); ctx.stroke();
+  const ticks = span <= 60 ? 12 : span / 60;
+  for (let i = 0; i < ticks; i++) {
+    const a = -Math.PI / 2 + Math.PI * 2 * i / ticks;
+    ctx.strokeStyle = rgba(P.c[8], .8); ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.moveTo(cx + Math.cos(a) * (R + 26), cy + Math.sin(a) * (R + 26)); ctx.lineTo(cx + Math.cos(a) * (R + 46), cy + Math.sin(a) * (R + 46)); ctx.stroke();
+  }
+  ctx.lineCap = 'round';
+  const [t0, t1] = b.time, unit = t1 >= 60 ? 'min' : 's';
+  const big = t0 === t1 ? minutes(t0) : `${minutes(t0)}–${minutes(t1)}`;
+  text(ctx, big, cx, cy + 40, big.length > 4 ? 110 : 140, P.fg, { font: SERIF, weight: '300', align: 'center' });
+  text(ctx, unit, cx, cy + 110, 44, P.dfg, { align: 'center', spacing: 4 });
+  text(ctx, `${b.infusions} ${b.infusions === 1 ? 'infusion' : 'infusions'}`, x + w - 56, y + 96, 38, P.dfg, { align: 'right' });
+}
+
+// The dry tea: the weight and a small drawing of the leaves.
+function leafGauge(ctx, P, x, y, w, h, r) {
+  const b = CURRENT.brew;
+  card(ctx, P, x, y, w, h, 'TEA');
+  text(ctx, `${b.leaf}`, x + 56, y + h - 110, 180, P.fg, { font: SERIF, weight: '300' });
+  ctx.save(); ctx.font = `300 180px ${SERIF}`; const nw = ctx.measureText(`${b.leaf}`).width; ctx.restore();
+  text(ctx, 'g', x + 76 + nw, y + h - 110, 60, P.dfg);
+  // A small pile of the dry tea on the right, scaled to fit beside the number
+  const px = x + w * .76, py = y + h * .6, leaf = CURRENT.leaf;
+  ctx.save(); ctx.translate(px, py); ctx.scale(.62, .62); ctx.translate(-px, -py);
+  const dark = P.light ? '#2a1d14' : mix(P.fg, P.bg, .25);
+  ctx.save();
+  if (leaf === 'powder') {
+    const g = ctx.createRadialGradient(px - 40, py - 80, 10, px, py, 220);
+    g.addColorStop(0, mix(CURRENT.liquor, '#ffffff', .25)); g.addColorStop(1, mix(CURRENT.liquor, '#000000', .2));
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.moveTo(px - 220, py + 90); ctx.bezierCurveTo(px - 120, py + 40, px - 60, py - 120, px, py - 130);
+    ctx.bezierCurveTo(px + 60, py - 120, px + 120, py + 40, px + 220, py + 90); ctx.closePath(); ctx.fill();
+  } else if (leaf === 'pearls') {
+    for (let i = 0; i < 26; i++) {
+      const a = r() * Math.PI * 2, d = Math.sqrt(r()) * 170, qx = px + Math.cos(a) * d * 1.3, qy = py + 30 + Math.sin(a) * d * .55;
+      ctx.fillStyle = mix('#6f7350', P.bg, P.light ? .05 : .15); circle(ctx, qx, qy, 26); ctx.fill();
+      ctx.fillStyle = rgba('#e8e6da', .7); circle(ctx, qx - 8, qy - 9, 9); ctx.fill();
+    }
+  } else if (leaf === 'twisted') {
+    ctx.lineCap = 'round';
+    for (let i = 0; i < 46; i++) {
+      const a = r() * Math.PI * 2, d = Math.sqrt(r()) * 180, qx = px + Math.cos(a) * d * 1.3, qy = py + 30 + Math.sin(a) * d * .55;
+      const t = r() * Math.PI, l = 40 + r() * 40;
+      const petal = r() < .1;
+      ctx.strokeStyle = petal ? '#4a6fd8' : mix(dark, '#000000', r() * .4); ctx.lineWidth = petal ? 16 : 11;
+      ctx.beginPath(); ctx.moveTo(qx - Math.cos(t) * l, qy - Math.sin(t) * l);
+      ctx.quadraticCurveTo(qx + (r() - .5) * 40, qy + (r() - .5) * 40, qx + Math.cos(t) * l, qy + Math.sin(t) * l); ctx.stroke();
+    }
+  } else {
+    for (let i = 0; i < 70; i++) {
+      const a = r() * Math.PI * 2, d = Math.sqrt(r()) * 190, qx = px + Math.cos(a) * d * 1.3, qy = py + 30 + Math.sin(a) * d * .55;
+      ctx.fillStyle = P.light ? '#2a1608' : '#8a5a36'; circle(ctx, qx, qy, 9); ctx.fill();
+    }
+    for (let i = 0; i < 7; i++) {
+      const qx = px + (r() - .5) * 360, qy = py + 10 + (r() - .5) * 120;
+      ctx.save(); ctx.translate(qx, qy); ctx.rotate(r() * Math.PI);
+      ctx.fillStyle = '#9aa35e'; ctx.beginPath(); ctx.ellipse(0, 0, 44, 22, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+  }
+  ctx.restore();
+  ctx.restore();
+}
+
+// Water and milk: the volume and a glass that fills to it.
+function waterGauge(ctx, P, x, y, w, h) {
+  const b = CURRENT.brew, total = b.water + (b.milk || 0);
+  card(ctx, P, x, y, w, h, b.milk ? 'WATER AND MILK' : 'WATER');
+  text(ctx, `${total}`, x + 56, y + h - 110, 180, P.fg, { font: SERIF, weight: '300' });
+  ctx.save(); ctx.font = `300 180px ${SERIF}`; const nw = ctx.measureText(`${total}`).width; ctx.restore();
+  text(ctx, 'ml', x + 76 + nw, y + h - 110, 60, P.dfg);
+  if (b.milk) text(ctx, `${b.water} ml water, ${b.milk} ml milk`, x + 56, y + h - 46, 36, P.dfg);
+  // A glass on the right, filled to scale against 300 ml
+  const gx = x + w * .83, gb = y + h - 90, gh = 280, gw = 150;
+  const fill = Math.min(1, total / 300) * gh * .9;
+  const milk = b.milk ? fill * b.milk / total : 0;
+  ctx.save();
+  ctx.beginPath(); ctx.moveTo(gx - gw / 2, gb - gh); ctx.lineTo(gx - gw / 2 + 20, gb); ctx.lineTo(gx + gw / 2 - 20, gb); ctx.lineTo(gx + gw / 2, gb - gh); ctx.closePath();
+  ctx.save(); ctx.clip();
+  ctx.fillStyle = rgba(P.second, P.light ? .35 : .45); ctx.fillRect(gx - gw, gb - fill, gw * 2, fill - milk);
+  if (milk) { ctx.fillStyle = rgba('#f3ead9', P.light ? .9 : .75); ctx.fillRect(gx - gw, gb - milk, gw * 2, milk); }
+  ctx.restore();
+  ctx.strokeStyle = rgba(P.fg, .8); ctx.lineWidth = 6; ctx.stroke();
+  ctx.restore();
+}
+
+// The steps, numbered, under the gauges.
+function steps(ctx, P, x, y, width) {
+  text(ctx, 'BREW', x, y, 38, P.c[8], { spacing: 7 });
+  let yy = y + 90;
+  CURRENT.steps.forEach((st, i) => {
+    ctx.fillStyle = P.accent; circle(ctx, x + 30, yy - 16, 30); ctx.fill();
+    text(ctx, `${i + 1}`, x + 30, yy, 40, P.light ? P.bg : P.darker, { align: 'center', weight: '700' });
+    const lines = wrap(ctx, st, 46, width - 110);
+    lines.forEach((l, j) => text(ctx, l, x + 100, yy + j * 64, 46, P.fg));
+    yy += lines.length * 64 + 40;
+  });
+}
+
+function brew(ctx, P, r, noise) {
+  paperBase(ctx, P, noise);
+  let ty = titleBlock(ctx, P, 300, 420);
+  let cx = 300; ty += 60;
+  [CURRENT.origin].filter(Boolean).forEach(cp => { cx += chip(ctx, P, cx, ty, cp) + 24; });
+  steps(ctx, P, 300, ty + 260, 1500);
+  const gx = 2050, gy = 300, gw = 700, gh = 660, gap = 60;
+  tempGauge(ctx, P, gx, gy, gw, gh);
+  timeGauge(ctx, P, gx + gw + gap, gy, gw, gh);
+  leafGauge(ctx, P, gx, gy + gh + gap, gw, gh, r);
+  waterGauge(ctx, P, gx + gw + gap, gy + gh + gap, gw, gh);
+  vignette(ctx, P, P.light ? .12 : .35);
+  grain(ctx, P.index * 29, .04);
+}
+
+// ---------- entry point ----------
+
+const KINDS = { brew };
+let CURRENT = null;
+
+window.renderImage = async (theme, kind, width, height, mime = 'image/png', quality = .92) => {
+  await document.fonts.load(`40px ${MONO}`);
+  await document.fonts.load(`300 40px ${SERIF}`);
+  const cv = document.getElementById('c');
+  cv.width = width; cv.height = height;
+  const ctx = cv.getContext('2d');
+  S = width / W;
+  ctx.setTransform(S, 0, 0, S, 0, 0);
+  CURRENT = theme;
+  const c = theme.colors;
+  const P = {
+    ...theme, light: c.mode === 'light', bg: c.background, fg: c.foreground, dfg: c.dark_foreground, darker: c.darker_background,
+    accent: c.accent, second: theme.second, c: theme.ansi, muted: c.muted, base: theme.base,
+  };
+  const r = rng(theme.index * 104729 + Object.keys(KINDS).indexOf(kind) * 7 + (P.light ? 3 : 0));
+  const noise = makeNoise(theme.index * 7907 + 3);
+  KINDS[kind](ctx, P, r, noise);
+  return cv.toDataURL(mime, quality);
+};
+</script>
+</body>
+</html>
